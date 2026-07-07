@@ -1,0 +1,40 @@
+server:
+  port: 8080
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
+
+spring:
+  application:
+    name: ml-platform-backend
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+      continue-on-error: true
+
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://mysql:3306/ml_platform?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useUnicode=true&characterEncoding=UTF-8
+    username: root
+    password: 22302010009Fyr
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.mlplatform.model
+  configuration:
+    map-underscore-to-camel-case: true
+
+logging:
+  level:
+    com.mlplatform: DEBUG
+    org.springframework: INFO
+
+llm:
+  api-key: sk-BYbT02LK6xgoKl5ftp8xLQ
+  endpoint: https://llmapi.paratera.com
+  model: GLM-4.5-Flash
+  max-tokens: 1000

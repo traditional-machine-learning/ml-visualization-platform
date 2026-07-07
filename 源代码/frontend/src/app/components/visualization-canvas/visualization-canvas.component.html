@@ -1,0 +1,37 @@
+<mat-card class="canvas-card">
+  <mat-card-header>
+    <mat-card-title>
+      可视化画布
+      <span *ngIf="algorithm" class="algorithm-badge">{{ algorithm.displayName }}</span>
+      <span *ngIf="dataset" class="dataset-badge">{{ dataset.name }}</span>
+    </mat-card-title>
+  </mat-card-header>
+  <mat-card-content>
+    <div *ngIf="dataset; else emptyState" class="canvas-wrapper">
+      <div class="chart-area">
+        <div #chartHost class="chart-frame"></div>
+        <div #importanceHost class="importance-frame" *ngIf="trainingState?.modelData?.featureImportances?.length"></div>
+      </div>
+
+      <div class="legend" *ngIf="dataset.dataPoints && dataset.dataPoints.length > 0">
+        <div class="legend-title">点图例</div>
+        <div *ngFor="let feature of getUniqueLabels()" class="legend-item">
+          <span class="legend-color" [style.backgroundColor]="getLegendColor(feature)"></span>
+          <span class="legend-label">{{ feature }}</span>
+        </div>
+      </div>
+    </div>
+
+    <ng-template #emptyState>
+      <div class="empty-canvas">
+        <mat-icon class="empty-icon">scatter_plot</mat-icon>
+        <p class="empty-text">选择数据集以预览可视化区域。</p>
+      </div>
+    </ng-template>
+
+    <div *ngIf="trainingState?.status === 'training'" class="training-indicator">
+      <mat-spinner diameter="20"></mat-spinner>
+      <span>训练正在进行...</span>
+    </div>
+  </mat-card-content>
+</mat-card>

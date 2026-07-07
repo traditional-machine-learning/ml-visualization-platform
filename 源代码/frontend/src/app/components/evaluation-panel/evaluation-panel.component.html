@@ -1,0 +1,33 @@
+<div class="eval-wrap" *ngIf="evaluation; else waitingState">
+  <p class="section-label">评估指标</p>
+
+  <div class="metric-grid">
+    <div class="metric-card" *ngFor="let card of metricCards" [style.--accent]="card.color">
+      <div class="card-label">{{ card.label }}</div>
+      <div class="card-value">{{ card.value }}</div>
+      <div class="card-delta" [class.up]="card.positive" [class.down]="!card.positive">{{ card.delta }}</div>
+    </div>
+  </div>
+
+  <div class="chart-card" *ngIf="evaluation.chart.length > 0">
+    <div class="chart-header">
+      <div>
+        <span class="chart-title">训练轨迹</span>
+        <span class="chart-sub">{{ normalizeLabel(evaluation.lossLabel) }} &darr; &middot; {{ normalizeLabel(evaluation.scoreLabel) }} &uarr;</span>
+      </div>
+      <div class="legend">
+        <span class="leg-item"><span class="leg-line loss"></span>{{ normalizeLabel(evaluation.lossLabel) }}</span>
+        <span class="leg-item"><span class="leg-line score"></span>{{ normalizeLabel(evaluation.scoreLabel) }}</span>
+      </div>
+    </div>
+
+    <div #chartHost class="chart-area"></div>
+  </div>
+</div>
+
+<ng-template #waitingState>
+  <div class="eval-wrap empty">
+    <p class="section-label">评估指标</p>
+    <p class="empty-copy">实验开始后将显示指标和训练曲线。</p>
+  </div>
+</ng-template>
