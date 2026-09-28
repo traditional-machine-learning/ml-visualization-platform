@@ -18,6 +18,9 @@ public interface DatasetRepository {
     @Select("SELECT * FROM dataset WHERE id = #{id}")
     Dataset findById(Long id);
 
+    @Select("SELECT * FROM dataset WHERE name = #{name}")
+    Dataset findByName(String name);
+
     @Select("SELECT * FROM dataset WHERE category = #{category}")
     List<Dataset> findByCategory(String category);
 
