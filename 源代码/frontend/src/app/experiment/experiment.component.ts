@@ -101,8 +101,30 @@ export class ExperimentComponent implements OnInit, OnDestroy {
   }
 
   onDatasetSelect(dataset: Dataset): void {
-    this.selectedDataset = dataset;
+    this.setSelectedDataset(dataset);
     this.resetTraining(false);
+  }
+
+  /**
+   * 统一的数据集赋值入口。列表接口只返回投影后的两个维度，这里再拉一次详情接口，
+   * 补上全维度元数据与每行原始值，画布的坐标轴选择器才有可选项。
+   * 详情拉取失败时保持精简版，选择器退化为投影的两轴，不影响其他功能。
+   */
+  private setSelectedDataset(dataset: Dataset | null): void {
+    this.selectedDataset = dataset;
+    if (!dataset || this.useMockFallback) {
+      return;
+    }
+    const id = dataset.id;
+    this.apiService.getDatasetById(id).subscribe({
+      next: (response) => {
+        // 防止慢响应的 A 数据集覆盖已切到 B 的选中项
+        if (response.success && this.selectedDataset?.id === id) {
+          this.selectedDataset = response.data;
+        }
+      },
+      error: () => { /* 保持精简版数据 */ }
+    });
   }
 
   onParameterChange(paramName: string, value: any): void {
@@ -158,7 +180,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     const loaded = this.learningGuideData.loadCase(caseId);
     this.activeCaseId = caseId;
     this.selectedAlgorithm = loaded.algorithm;
-    this.selectedDataset = loaded.dataset;
+    this.setSelectedDataset(loaded.dataset);
     this.parameterValues = this.buildParameterValues(loaded.algorithm, loaded.parameters);
     this.resetTraining(false);
   }
@@ -175,7 +197,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     if (!algorithm || !dataset) {
       this.activeCaseId = null;
       this.selectedAlgorithm = null;
-      this.selectedDataset = null;
+      this.setSelectedDataset(null);
       this.parameterValues = {};
       this.resetTraining(false);
       this.statusBanner = `引导式案例"${guidedCase.title}"缺少API数据。`;
@@ -184,7 +206,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
 
     this.activeCaseId = caseId;
     this.selectedAlgorithm = algorithm;
-    this.selectedDataset = dataset;
+    this.setSelectedDataset(dataset);
     this.parameterValues = this.buildParameterValues(algorithm, guidedCase.parameterPreset);
     this.resetTraining(false);
   }
@@ -205,7 +227,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     }
     this.activeCaseId = null;
     this.selectedAlgorithm = null;
-    this.selectedDataset = null;
+    this.setSelectedDataset(null);
     this.parameterValues = {};
     this.resetTraining(false);
     this.statusBanner = 'API不可用。未找到本地演示案例。';

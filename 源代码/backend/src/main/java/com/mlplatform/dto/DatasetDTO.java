@@ -1,6 +1,9 @@
 package com.mlplatform.dto;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+
 import java.util.List;
+import java.util.Map;
 
 public class DatasetDTO {
     private Long id;
@@ -11,6 +14,10 @@ public class DatasetDTO {
     private Integer sampleCount;
     private List<FeatureInfo> features;
     private List<DataPoint> dataPoints;
+
+    /** 数据集声明的全部维度元数据（仅详情接口返回，列表接口为 null 不序列化） */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private List<FeatureInfo> dimensions;
 
     public static class FeatureInfo {
         private String name;
@@ -31,6 +38,12 @@ public class DatasetDTO {
         private String label;
         private Integer clusterId;
 
+        /** 该行各维度的原始值（按特征名索引，仅详情接口返回，列表接口为 null 不序列化） */
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        private Map<String, Double> values;
+
+        public Map<String, Double> getValues() { return values; }
+        public void setValues(Map<String, Double> values) { this.values = values; }
         public Double getX() { return x; }
         public void setX(Double x) { this.x = x; }
         public Double getY() { return y; }
@@ -57,4 +70,6 @@ public class DatasetDTO {
     public void setFeatures(List<FeatureInfo> features) { this.features = features; }
     public List<DataPoint> getDataPoints() { return dataPoints; }
     public void setDataPoints(List<DataPoint> dataPoints) { this.dataPoints = dataPoints; }
+    public List<FeatureInfo> getDimensions() { return dimensions; }
+    public void setDimensions(List<FeatureInfo> dimensions) { this.dimensions = dimensions; }
 }

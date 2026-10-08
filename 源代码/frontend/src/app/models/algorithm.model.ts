@@ -7,6 +7,8 @@ export interface Dataset {
   sampleCount: number;
   features: FeatureInfo[];
   dataPoints: DataPoint[];
+  /** 数据集声明的全部维度（仅详情接口返回），用于坐标轴选择 */
+  dimensions?: FeatureInfo[];
 }
 
 export interface FeatureInfo {
@@ -20,6 +22,8 @@ export interface DataPoint {
   y: number;
   label?: string;
   clusterId?: number;
+  /** 该行各维度的原始值（仅详情接口返回），键为特征名 */
+  values?: { [name: string]: number };
 }
 
 export interface Algorithm {

@@ -23,8 +23,7 @@ public class VisualizationController {
 
     @GetMapping("/data-points/{datasetId}")
     public ApiResponse<List<DatasetDTO.DataPoint>> getDataPoints(@PathVariable Long datasetId) {
-        DatasetDTO dataset = datasetService.getDatasetById(datasetId);
-        return ApiResponse.success(dataset.getDataPoints());
+        return ApiResponse.success(datasetService.getDataPoints(datasetId));
     }
 
     // Reserved for Team Member 2 - Decision boundary visualization

@@ -10,7 +10,7 @@ import {
   ViewChild
 } from '@angular/core';
 import * as echarts from 'echarts';
-import { Algorithm, Dataset, TrainingState } from '../../models/algorithm.model';
+import { Algorithm, DataPoint, Dataset, FeatureInfo, TrainingState } from '../../models/algorithm.model';
 
 @Component({
   selector: 'app-visualization-canvas',
@@ -21,6 +21,12 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   @Input() dataset: Dataset | null = null;
   @Input() algorithm: Algorithm | null = null;
   @Input() trainingState: TrainingState | null = null;
+
+  /** 坐标轴可选维度（来自数据集详情接口），以及当前选中的两个维度名 */
+  axisOptions: FeatureInfo[] = [];
+  selectedXName: string | null = null;
+  selectedYName: string | null = null;
+  private currentDatasetId: number | null = null;
 
   @ViewChild('chartHost')
   set chartHostRef(host: ElementRef<HTMLDivElement> | undefined) {
@@ -52,9 +58,128 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   }
 
   ngOnChanges(changes: SimpleChanges): void {
+    if (changes['dataset']) {
+      // 数据集可能先后到达两次：列表接口的投影版本，随后是详情接口的全维度版本
+      this.syncAxisSelection(changes['dataset'].currentValue);
+    }
     if (changes['dataset'] || changes['algorithm'] || changes['trainingState']) {
       this.renderChart();
     }
+  }
+
+  // ==================== 坐标轴选择 ====================
+
+  get isPcaView(): boolean {
+    return !!this.trainingState?.modelData?.pcaTransformed?.length;
+  }
+
+  /** 当前两轴是否就是训练所用的投影维度（只有此时叠加线才有意义） */
+  get isProjectionView(): boolean {
+    const projectedX = this.dataset?.features?.[0]?.name ?? null;
+    const projectedY = this.dataset?.features?.[1]?.name ?? null;
+    if (!projectedX || !projectedY) {
+      return true;
+    }
+    return this.selectedXName === projectedX && this.selectedYName === projectedY;
+  }
+
+  get pickersEnabled(): boolean {
+    return this.axisOptions.length >= 2;
+  }
+
+  get showAxisHint(): boolean {
+    return !this.isPcaView && !this.isProjectionView && !!this.algorithm;
+  }
+
+  /** 训练实际使用的两个维度，用于提示文案 */
+  get projectedAxesLabel(): string {
+    const x = this.getAxisDisplayName(this.dataset?.features?.[0]?.name ?? null, 'X');
+    const y = this.getAxisDisplayName(this.dataset?.features?.[1]?.name ?? null, 'Y');
+    return `${x} / ${y}`;
+  }
+
+  onAxisChange(axis: 'x' | 'y', dimName: string): void {
+    if (axis === 'x') {
+      this.selectedXName = dimName;
+    } else {
+      this.selectedYName = dimName;
+    }
+    this.renderChart();
+  }
+
+  /** 数据集变化时重建可选维度并维护默认选中项 */
+  private syncAxisSelection(dataset: Dataset | null): void {
+    if (!dataset) {
+      this.axisOptions = [];
+      this.selectedXName = null;
+      this.selectedYName = null;
+      this.currentDatasetId = null;
+      return;
+    }
+
+    const options = this.buildAxisOptions(dataset);
+    const names = new Set(options.map((dim) => dim.name));
+    const defaultX = dataset.features?.[0]?.name ?? null;
+    const defaultY = dataset.features?.[1]?.name ?? null;
+
+    this.axisOptions = options;
+
+    if (dataset.id !== this.currentDatasetId) {
+      this.currentDatasetId = dataset.id;
+      this.selectedXName = defaultX;
+      this.selectedYName = defaultY;
+      return;
+    }
+
+    // 同一数据集的新对象（详情数据到达）：选中项仍存在就保留，否则回到投影的两轴
+    if (!this.selectedXName || !names.has(this.selectedXName)) {
+      this.selectedXName = defaultX;
+    }
+    if (!this.selectedYName || !names.has(this.selectedYName)) {
+      this.selectedYName = defaultY;
+    }
+  }
+
+  /**
+   * 可选维度 = 全部非 label 维度 + 当前投影的两轴。
+   * 后者的补充是必需的：boston 的投影 Y 就是 label 类型的 medv，
+   * 不补上会出现"正在绘制的维度在下拉框里找不到"。
+   */
+  private buildAxisOptions(dataset: Dataset): FeatureInfo[] {
+    const declared = dataset.dimensions?.length ? dataset.dimensions : (dataset.features ?? []);
+    const options = declared.filter((dim) => dim.type !== 'label');
+
+    for (const projected of dataset.features ?? []) {
+      if (!options.some((dim) => dim.name === projected.name)) {
+        options.push(projected);
+      }
+    }
+
+    return options.length ? options : (dataset.features ?? []);
+  }
+
+  private getAxisDisplayName(dimName: string | null, fallback: string): string {
+    if (!dimName) {
+      return fallback;
+    }
+    const matched = this.axisOptions.find((dim) => dim.name === dimName)
+      ?? this.dataset?.features?.find((dim) => dim.name === dimName);
+    return matched?.displayName || dimName;
+  }
+
+  /**
+   * 取某点在指定维度上的值。投影维度直接读 point.x / point.y：
+   * 既保证默认视图与改动前完全一致，也避开后端投影时的兜底替换
+   * （那里 point.x 可能取自别的列，与 values[xName] 并不一致）。
+   */
+  private getPointAxisValue(point: DataPoint, dimName: string | null, index: 0 | 1): number | null {
+    const projectedName = this.dataset?.features?.[index]?.name ?? null;
+    // 未选择或缺少特征元数据时退回投影坐标，避免整张图空白
+    if (!dimName || !projectedName || dimName === projectedName) {
+      return index === 0 ? point.x : point.y;
+    }
+    const value = point.values?.[dimName];
+    return typeof value === 'number' && isFinite(value) ? value : null;
   }
 
   ngOnDestroy(): void {
@@ -134,6 +259,9 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     }
 
     const overlaySeries = this.getOverlaySeries();
+    // 轴名在 setOption 之前取好，避免 tooltip 闭包读到后续变更
+    const xAxisLabel = this.isPcaView ? 'PC1' : this.getAxisDisplayName(this.selectedXName, 'Feature X');
+    const yAxisLabel = this.isPcaView ? 'PC2' : this.getAxisDisplayName(this.selectedYName, 'Feature Y');
 
     this.chart.setOption({
       animation: true,
@@ -150,7 +278,7 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
         },
         formatter: (params: any) => {
           if (Array.isArray(params.value)) {
-            return `${params.seriesName}<br/>x: ${params.value[0]}<br/>y: ${params.value[1]}`;
+            return `${params.seriesName}<br/>${xAxisLabel}: ${params.value[0]}<br/>${yAxisLabel}: ${params.value[1]}`;
           }
           return params.seriesName;
         }
@@ -163,7 +291,7 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
       },
       xAxis: {
         type: 'value',
-        name: this.dataset.features[0]?.displayName || 'Feature X',
+        name: xAxisLabel,
         nameLocation: 'middle',
         nameGap: 34,
         nameTextStyle: { color: '#1e293b', fontWeight: 600, fontSize: 11 },
@@ -173,7 +301,7 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
       },
       yAxis: {
         type: 'value',
-        name: this.dataset.features[1]?.displayName || 'Feature Y',
+        name: yAxisLabel,
         nameLocation: 'middle',
         nameGap: 44,
         nameTextStyle: { color: '#1e293b', fontWeight: 600, fontSize: 11 },
@@ -224,12 +352,18 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   private groupPoints(): Record<string, number[][]> {
     const grouped: Record<string, number[][]> = {};
 
+    // 索引必须是原始行号：聚类 assignments 按下标对齐
     this.dataset?.dataPoints.forEach((point, index) => {
+      const x = this.getPointAxisValue(point, this.selectedXName, 0);
+      const y = this.getPointAxisValue(point, this.selectedYName, 1);
+      if (x === null || y === null) {
+        return; // 该行缺少所选维度，不绘制
+      }
       const key = this.resolvePointLabel(point.label, point.clusterId, index);
       if (!grouped[key]) {
         grouped[key] = [];
       }
-      grouped[key].push([point.x, point.y]);
+      grouped[key].push([x, y]);
     });
 
     return grouped;
@@ -250,11 +384,19 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   }
 
   private resolveAssignment(index?: number): number | undefined {
-    const assignments = this.trainingState?.modelData?.assignments;
+    const assignments = this.activeAssignments;
     if (index === undefined || !assignments || assignments.length !== this.dataset?.dataPoints?.length) {
       return undefined;
     }
     return assignments[index];
+  }
+
+  /**
+   * 聚类结果按下标与数据行对齐，只有投影视图（不跳点）才成立；
+   * 换了坐标轴就退回按 label / clusterId 着色。
+   */
+  private get activeAssignments(): number[] | undefined {
+    return this.isProjectionView ? this.trainingState?.modelData?.assignments : undefined;
   }
 
   private getColorMap(): Record<string, string> {
@@ -276,6 +418,12 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
 
   private getOverlaySeries(): any[] {
     if (!this.dataset?.dataPoints?.length || !this.algorithm) {
+      return [];
+    }
+
+    // 叠加线都是在训练的投影维度里算出来的，换轴后画上去必然错位；
+    // 连合成的动画兜底线/兜底聚类中心也一并隐藏（它们同样基于旧的 x/y 范围）。
+    if (this.isPcaView || !this.isProjectionView) {
       return [];
     }
 
