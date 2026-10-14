@@ -10,7 +10,8 @@ import {
   ViewChild
 } from '@angular/core';
 import * as echarts from 'echarts';
-import { Algorithm, DataPoint, Dataset, FeatureInfo, TrainingState } from '../../models/algorithm.model';
+import { Algorithm, DataPoint, Dataset, FeatureInfo, TrainingModelData, TrainingProjection, TrainingState } from '../../models/algorithm.model';
+import { ApiService } from '../../services/api.service';
 
 @Component({
   selector: 'app-visualization-canvas',
@@ -27,6 +28,8 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   selectedXName: string | null = null;
   selectedYName: string | null = null;
   private currentDatasetId: number | null = null;
+
+  constructor(private apiService: ApiService) {}
 
   @ViewChild('chartHost')
   set chartHostRef(host: ElementRef<HTMLDivElement> | undefined) {
@@ -53,6 +56,15 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   private importanceHost?: ElementRef<HTMLDivElement>;
   private importanceChart: echarts.ECharts | null = null;
 
+  /** 后端返回的平面投影结果，以及它对应的 (session, 坐标轴) 标识 */
+  private projection: TrainingProjection | null = null;
+  private projectionKey: string | null = null;
+  private requestedProjectionKey: string | null = null;
+  private projectionVersion = 0;
+  /** 模型版本：trainingState.modelData 每次换新对象就 +1，用于触发重新投影 */
+  private modelRevision = 0;
+  private lastModelData: TrainingModelData | undefined;
+
   ngAfterViewInit(): void {
     this.renderChart();
   }
@@ -62,7 +74,15 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
       // 数据集可能先后到达两次：列表接口的投影版本，随后是详情接口的全维度版本
       this.syncAxisSelection(changes['dataset'].currentValue);
     }
+    if (changes['trainingState']) {
+      const modelData = (changes['trainingState'].currentValue as TrainingState | null)?.modelData;
+      if (modelData !== this.lastModelData) {
+        this.lastModelData = modelData;
+        this.modelRevision += 1;
+      }
+    }
     if (changes['dataset'] || changes['algorithm'] || changes['trainingState']) {
+      this.requestProjection();
       this.renderChart();
     }
   }
@@ -73,29 +93,13 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     return !!this.trainingState?.modelData?.pcaTransformed?.length;
   }
 
-  /** 当前两轴是否就是训练所用的投影维度（只有此时叠加线才有意义） */
-  get isProjectionView(): boolean {
-    const projectedX = this.dataset?.features?.[0]?.name ?? null;
-    const projectedY = this.dataset?.features?.[1]?.name ?? null;
-    if (!projectedX || !projectedY) {
-      return true;
-    }
-    return this.selectedXName === projectedX && this.selectedYName === projectedY;
-  }
-
   get pickersEnabled(): boolean {
     return this.axisOptions.length >= 2;
   }
 
-  get showAxisHint(): boolean {
-    return !this.isPcaView && !this.isProjectionView && !!this.algorithm;
-  }
-
-  /** 训练实际使用的两个维度，用于提示文案 */
-  get projectedAxesLabel(): string {
-    const x = this.getAxisDisplayName(this.dataset?.features?.[0]?.name ?? null, 'X');
-    const y = this.getAxisDisplayName(this.dataset?.features?.[1]?.name ?? null, 'Y');
-    return `${x} / ${y}`;
+  /** 后端投影结果里的说明文案（"其余 N 维固定在均值" / "该算法仍只在两维上训练" 等） */
+  get projectionNote(): string | null {
+    return this.activeProjection?.note ?? null;
   }
 
   onAxisChange(axis: 'x' | 'y', dimName: string): void {
@@ -104,7 +108,64 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     } else {
       this.selectedYName = dimName;
     }
+    this.requestProjection();
     this.renderChart();
+  }
+
+  // ==================== 后端投影 ====================
+
+  /** 当前"视图"的标识：同一 session + 同一对坐标轴下的投影才可以复用 */
+  private viewKey(): string | null {
+    const sessionId = this.trainingState?.sessionId;
+    if (!sessionId || !this.selectedXName || !this.selectedYName || this.isPcaView) {
+      return null;
+    }
+    return `${sessionId}|${this.selectedXName}|${this.selectedYName}`;
+  }
+
+  /** 当前视图对应的投影；换轴或换 session 后旧结果立即失效 */
+  private get activeProjection(): TrainingProjection | null {
+    const key = this.viewKey();
+    return key && key === this.projectionKey ? this.projection : null;
+  }
+
+  /**
+   * 模型每更新一步就重新投影一次。请求按 (session, 坐标轴, 模型版本) 去重，
+   * 响应带版本号丢弃过期结果，因此快速换轴不会画出错位的线。
+   */
+  private requestProjection(): void {
+    const key = this.viewKey();
+    const sessionId = this.trainingState?.sessionId;
+    if (!key || !sessionId || !this.selectedXName || !this.selectedYName) {
+      this.projection = null;
+      this.projectionKey = null;
+      this.requestedProjectionKey = null;
+      return;
+    }
+    const requestKey = `${key}|${this.modelRevision}`;
+    if (this.requestedProjectionKey === requestKey) {
+      return;
+    }
+    this.requestedProjectionKey = requestKey;
+    const version = ++this.projectionVersion;
+    this.apiService.getProjection(sessionId, this.selectedXName, this.selectedYName).subscribe({
+      next: (response) => {
+        if (version !== this.projectionVersion) {
+          return;
+        }
+        this.projection = response.success ? response.data : null;
+        this.projectionKey = key;
+        this.renderChart();
+      },
+      error: () => {
+        if (version !== this.projectionVersion) {
+          return;
+        }
+        this.projection = null;
+        this.projectionKey = null;
+        this.renderChart();
+      }
+    });
   }
 
   /** 数据集变化时重建可选维度并维护默认选中项 */
@@ -392,11 +453,11 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   }
 
   /**
-   * 聚类结果按下标与数据行对齐，只有投影视图（不跳点）才成立；
-   * 换了坐标轴就退回按 label / clusterId 着色。
+   * 簇编号由后端在全维度空间里算出、按数据行下标对齐，因此换任何坐标轴都成立，
+   * 不再像以前那样只在训练用的两维上才敢用来着色。
    */
   private get activeAssignments(): number[] | undefined {
-    return this.isProjectionView ? this.trainingState?.modelData?.assignments : undefined;
+    return this.trainingState?.modelData?.assignments;
   }
 
   private getColorMap(): Record<string, string> {
@@ -416,27 +477,32 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     };
   }
 
+  /**
+   * 叠加层统一走后端投影结果：全维模型（线性回归 / 逻辑回归 / K-Means）会在所选平面上重新求几何，
+   * 决策树 / SVM 只有在两维等于训练维度时才回放结果，其余情况后端给出 kind = "none" + 说明文案。
+   */
   private getOverlaySeries(): any[] {
-    if (!this.dataset?.dataPoints?.length || !this.algorithm) {
+    if (!this.dataset?.dataPoints?.length || !this.algorithm || this.isPcaView) {
       return [];
     }
 
-    // 叠加线都是在训练的投影维度里算出来的，换轴后画上去必然错位；
-    // 连合成的动画兜底线/兜底聚类中心也一并隐藏（它们同样基于旧的 x/y 范围）。
-    if (this.isPcaView || !this.isProjectionView) {
+    const projection = this.activeProjection;
+    if (projection) {
+      return this.buildProjectionSeries(projection);
+    }
+
+    // 已经开始训练但投影还没回来：先不画，避免出现与全维模型不符的兜底线
+    if (this.trainingState?.sessionId) {
       return [];
     }
 
-    const modelData = this.trainingState?.modelData;
+    // 尚未开始训练时，沿用原来的合成动画作为占位
     const fallbackLine = this.getFallbackLine();
-    const decisionBoundary = modelData?.decisionBoundary;
-    const regressionLine = modelData?.regressionLine;
-
     if (this.algorithm.type === 'classification') {
       return [{
         name: '决策边界',
         type: 'line',
-        data: this.isLineData(decisionBoundary) ? decisionBoundary : fallbackLine,
+        data: fallbackLine,
         symbol: 'none',
         lineStyle: {
           color: 'rgba(0, 0, 0, 0.55)',
@@ -451,7 +517,7 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
       return [{
         name: '回归线',
         type: 'line',
-        data: this.isLineData(regressionLine) ? regressionLine : fallbackLine,
+        data: fallbackLine,
         symbol: 'none',
         lineStyle: {
           color: 'rgba(0, 0, 0, 0.65)',
@@ -462,37 +528,64 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     }
 
     if (this.algorithm.type === 'clustering') {
-      const centroids = modelData?.centroids?.length
-        ? modelData.centroids.map((centroid) => [centroid.x, centroid.y, centroid.clusterId])
-        : this.getFallbackCentroids();
-
-      return [{
-        name: '聚类中心',
-        type: 'scatter',
-        symbol: 'diamond',
-        symbolSize: 14,
-        data: centroids,
-        itemStyle: {
-          color: 'rgba(255,255,255,0.92)',
-          borderColor: 'rgba(15,23,42,0.35)',
-          borderWidth: 1.5,
-          shadowBlur: 10,
-          shadowColor: 'rgba(0,0,0,0.25)'
-        },
-        label: {
-          show: true,
-          formatter: (params: any) => `C${Number(params.value[2]) + 1}`,
-          color: '#94A3B8',
-          fontWeight: 600,
-          fontSize: 10,
-          position: 'top',
-          distance: 6
-        },
-        z: 20
-      }];
+      return [this.buildCentroidSeries(this.getFallbackCentroids())];
     }
 
     return [];
+  }
+
+  private buildProjectionSeries(projection: TrainingProjection): any[] {
+    if (projection.kind === 'centroids') {
+      const centroids = (projection.centroids ?? []).map((centroid, index) => [
+        centroid.x,
+        centroid.y,
+        centroid.clusterId ?? index
+      ]);
+      return centroids.length ? [this.buildCentroidSeries(centroids)] : [];
+    }
+
+    const line = projection.line;
+    if (!this.isLineData(line)) {
+      return [];
+    }
+    const isRegression = projection.kind === 'regression_line';
+    return [{
+      name: isRegression ? '回归线' : '决策边界',
+      type: 'line',
+      data: line,
+      symbol: 'none',
+      lineStyle: isRegression
+        ? { color: 'rgba(0, 0, 0, 0.65)', width: 1.5 }
+        : { color: 'rgba(0, 0, 0, 0.55)', width: 1.5, type: 'dashed' },
+      z: 10
+    }];
+  }
+
+  private buildCentroidSeries(centroids: number[][]): any {
+    return {
+      name: '聚类中心',
+      type: 'scatter',
+      symbol: 'diamond',
+      symbolSize: 14,
+      data: centroids,
+      itemStyle: {
+        color: 'rgba(255,255,255,0.92)',
+        borderColor: 'rgba(15,23,42,0.35)',
+        borderWidth: 1.5,
+        shadowBlur: 10,
+        shadowColor: 'rgba(0,0,0,0.25)'
+      },
+      label: {
+        show: true,
+        formatter: (params: any) => `C${Number(params.value[2]) + 1}`,
+        color: '#94A3B8',
+        fontWeight: 600,
+        fontSize: 10,
+        position: 'top',
+        distance: 6
+      },
+      z: 20
+    };
   }
 
   private getFallbackLine(): number[][] {

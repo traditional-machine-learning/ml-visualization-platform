@@ -24,13 +24,31 @@ export class FeatureSelectionComponent implements OnInit {
 
   onDatasetChange(idStr: any) {
     const id = Number(idStr);
-    this.selectedDataset = this.datasets.find(d => d.id === id);
-    // Reset selected features when dataset changes
-    this.selectedFeatures = [];
-    if (this.selectedDataset && this.selectedDataset.features) {
-      // Default select all features
-      this.selectedFeatures = this.selectedDataset.features.map(f => f.name);
+    const dataset = this.datasets.find(d => d.id === id);
+    this.selectedDataset = dataset;
+    // 列表接口只返回投影后的两维，先用它兜底
+    this.selectedFeatures = this.selectableNames(dataset?.features);
+
+    if (!dataset) {
+      return;
     }
+    // 详情接口带全维度元数据，特征选择才能在全部维度里做（标签列由后端自动保留）
+    this.api.getDatasetById(id).subscribe({
+      next: (r) => {
+        if (!r.success || this.selectedDataset?.id !== id) {
+          return;
+        }
+        this.selectedDataset = r.data;
+        this.selectedFeatures = this.selectableNames(r.data.dimensions ?? r.data.features);
+      },
+      error: () => { /* 保持列表接口的精简版 */ }
+    });
+  }
+
+  private selectableNames(features?: FeatureInfo[]): string[] {
+    return (features ?? [])
+      .filter(f => f.type !== 'label')
+      .map(f => f.name);
   }
 
   toggleFeature(name: string) {

@@ -34,9 +34,9 @@
   </mat-card-header>
   <mat-card-content>
     <div *ngIf="dataset; else emptyState" class="canvas-wrapper">
-      <div class="axis-hint" *ngIf="showAxisHint">
+      <div class="axis-hint" *ngIf="projectionNote">
         <mat-icon class="axis-hint-icon">info</mat-icon>
-        <span>当前坐标轴不是训练投影（{{ projectedAxesLabel }}），决策边界 / 回归线 / 聚类中心已隐藏。</span>
+        <span>{{ projectionNote }}</span>
       </div>
 
       <div class="chart-area">

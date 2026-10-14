@@ -70,6 +70,13 @@ public class TrainingSimulationResponse {
         private List<Centroid> centroids;
         private List<Double> weights;
         private Double bias;
+        /**
+         * 全维度模型的元信息：算法种类、训练所用的全部维度名、监督学习的目标维度名。
+         * 决策树 / 随机森林 / SVM 仍在两维上训练，这些字段可能为 null。
+         */
+        private String modelKind;
+        private List<String> featureNames;
+        private String targetName;
         private List<Integer> assignments;
         private String splitFeature;
         private Double splitThreshold;
@@ -88,6 +95,12 @@ public class TrainingSimulationResponse {
         public void setWeights(List<Double> weights) { this.weights = weights; }
         public Double getBias() { return bias; }
         public void setBias(Double bias) { this.bias = bias; }
+        public String getModelKind() { return modelKind; }
+        public void setModelKind(String modelKind) { this.modelKind = modelKind; }
+        public List<String> getFeatureNames() { return featureNames; }
+        public void setFeatureNames(List<String> featureNames) { this.featureNames = featureNames; }
+        public String getTargetName() { return targetName; }
+        public void setTargetName(String targetName) { this.targetName = targetName; }
         public List<Integer> getAssignments() { return assignments; }
         public void setAssignments(List<Integer> assignments) { this.assignments = assignments; }
         public String getSplitFeature() { return splitFeature; }
@@ -108,6 +121,8 @@ public class TrainingSimulationResponse {
         private Double x;
         private Double y;
         private Integer clusterId;
+        /** 全维度质心坐标（按 ModelData.featureNames 顺序）；旧的 x / y 是它在默认投影两维上的取值 */
+        private List<Double> values;
 
         public Double getX() { return x; }
         public void setX(Double x) { this.x = x; }
@@ -115,6 +130,8 @@ public class TrainingSimulationResponse {
         public void setY(Double y) { this.y = y; }
         public Integer getClusterId() { return clusterId; }
         public void setClusterId(Integer clusterId) { this.clusterId = clusterId; }
+        public List<Double> getValues() { return values; }
+        public void setValues(List<Double> values) { this.values = values; }
     }
 
     public static class FeatureImportance {
