@@ -1,4 +1,6 @@
-import { Component } from '@angular/core';
+import { Component, OnDestroy, OnInit } from '@angular/core';
+import { NavigationEnd, NavigationStart, Router } from '@angular/router';
+import { Subscription } from 'rxjs';
 import { createQuestionBank, QuizQuestion } from './learning-question-bank';
 
 interface Lesson {
@@ -23,7 +25,7 @@ interface Lesson {
   templateUrl: './learning.component.html',
   styleUrls: ['./learning.component.scss']
 })
-export class LearningComponent {
+export class LearningComponent implements OnInit, OnDestroy {
   readonly lessons: Lesson[] = [
     {
       id: 'intro', title: '机器学习简介', category: '入门基础', duration: '10 分钟',
@@ -169,6 +171,37 @@ export class LearningComponent {
   quizSubmitted = false;
   quizScore: number | null = null;
   wrongQuestionIds: string[] = this.loadWrongQuestionIds();
+
+  /** 离开学习中心前的窗口滚动位置，返回时用来还原浏览位置。 */
+  private savedScrollTop = 0;
+  private navigationSub: Subscription | null = null;
+
+  constructor(private router: Router) {}
+
+  ngOnInit(): void {
+    this.navigationSub = this.router.events.subscribe((event) => {
+      // 离开学习中心前一刻抓取真实滚动位置：此时旧视图还在文档中，读到的值才准确
+      if (event instanceof NavigationStart) {
+        if (this.isLearningUrl(this.router.url) && !this.isLearningUrl(event.url)) {
+          this.savedScrollTop = window.scrollY;
+        }
+        return;
+      }
+      // 回到学习中心后，等视图重新挂载并完成布局再还原
+      if (event instanceof NavigationEnd && this.isLearningUrl(event.urlAfterRedirects)) {
+        setTimeout(() => window.scrollTo({ top: this.savedScrollTop }), 60);
+      }
+    });
+  }
+
+  ngOnDestroy(): void {
+    this.navigationSub?.unsubscribe();
+    this.navigationSub = null;
+  }
+
+  private isLearningUrl(url: string): boolean {
+    return url.split('?')[0].startsWith('/learn');
+  }
 
   get activeLesson(): Lesson { return this.lessons.find(lesson => lesson.id === this.activeId) || this.lessons[0]; }
   get progress(): number { return Math.round(this.completed.size / this.lessons.length * 100); }
