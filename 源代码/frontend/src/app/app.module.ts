@@ -1,6 +1,7 @@
 import { NgModule } from '@angular/core';
 import { BrowserModule } from '@angular/platform-browser';
 import { HttpClientModule } from '@angular/common/http';
+import { RouteReuseStrategy } from '@angular/router';
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 import { MatButtonModule } from '@angular/material/button';
@@ -33,6 +34,7 @@ import { FeatureSelectionComponent } from './components/feature-selection/featur
 import { AiAssistantComponent } from './components/ai-assistant/ai-assistant.component';
 import { TrainingLogComponent } from './components/training-log/training-log.component';
 import { LearningComponent } from './learning/learning.component';
+import { KeepAliveRouteReuseStrategy } from './routing/keep-alive-route-reuse.strategy';
 
 @NgModule({
   declarations: [
@@ -73,7 +75,9 @@ import { LearningComponent } from './learning/learning.component';
     MatTooltipModule,
     MatCheckboxModule,
   ],
-  providers: [],
+  providers: [
+    { provide: RouteReuseStrategy, useClass: KeepAliveRouteReuseStrategy }
+  ],
   bootstrap: [AppComponent]
 })
 export class AppModule { }

@@ -1,5 +1,6 @@
 import { Component, OnDestroy, OnInit } from '@angular/core';
-import { forkJoin } from 'rxjs';
+import { NavigationEnd, Router } from '@angular/router';
+import { filter, forkJoin, Subscription } from 'rxjs';
 import { Algorithm, Dataset, TrainingSimulationResponse, TrainingState } from '../models/algorithm.model';
 import {
   CaseGuidanceState,
@@ -49,16 +50,29 @@ export class ExperimentComponent implements OnInit, OnDestroy {
   private apiAlgorithms: Algorithm[] = [];
   private apiDatasets: Dataset[] = [];
   private catalogLoaded = false;
+  private navigationSub: Subscription | null = null;
   useMockFallback = environment.demoMode;
 
   constructor(
     private learningGuideData: LearningGuideDataService,
     private apiService: ApiService,
-    private experimentContext: ExperimentContextService
+    private experimentContext: ExperimentContextService,
+    private router: Router
   ) {}
 
   ngOnInit(): void {
     this.guidedCases = this.learningGuideData.getGuidedCases();
+
+    // 本组件被路由策略缓存后不会被销毁，切走再切回时不会重新初始化。
+    // 但缓存期间视图已脱离文档，ECharts 容器尺寸可能失效，返回时需按当前尺寸重算布局。
+    this.navigationSub = this.router.events
+      .pipe(filter((event): event is NavigationEnd => event instanceof NavigationEnd))
+      .subscribe((event) => {
+        if (event.urlAfterRedirects.split('?')[0].startsWith('/experiment')) {
+          setTimeout(() => window.dispatchEvent(new Event('resize')), 60);
+        }
+      });
+
     const defaultCase = this.guidedCases.find((item) => item.id === 'case-linear-weights') || this.guidedCases[0];
     if (this.useMockFallback) {
       if (defaultCase) {
@@ -74,6 +88,8 @@ export class ExperimentComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.clearTrainingTimer();
+    this.navigationSub?.unsubscribe();
+    this.navigationSub = null;
   }
 
   getTotalSteps(): number {
