@@ -25,6 +25,8 @@ import java.util.Map;
 public class TrainingSimulationService {
     private static final int DEFAULT_TOTAL_STEPS = 100;
     private static final double EPSILON = 1.0e-9;
+    /** 随机森林仍按两维训练，树行里的特征名固定为 x / y */
+    private static final List<String> RF_TREE_FEATURES = List.of("x", "y");
 
     private final AlgorithmRepository algorithmRepository;
     private final DatasetRepository datasetRepository;
@@ -297,16 +299,11 @@ public class TrainingSimulationService {
             ProjectionDTO projection,
             String xName,
             String yName) {
-        List<String> axes = trainingAxes(dataset);
-        String trainedX = axes.get(0);
-        String trainedY = axes.get(1);
-        String trainingLabel = trainedX + " / " + trainedY;
-        if (trainedX == null || trainedY == null) {
-            return noProjection(projection, "数据集缺少可用于训练的维度。");
-        }
-        if (!trainedX.equals(xName) || !trainedY.equals(yName)) {
-            return noProjection(projection,
-                    "该算法当前仍只在 " + trainingLabel + " 这两个维度上训练，切换到其他坐标轴无法显示结果。");
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        int xIndex = data.featureIndex(xName);
+        int yIndex = data.featureIndex(yName);
+        if (xIndex < 0 || yIndex < 0 || xIndex == yIndex) {
+            return noProjection(projection, "决策树的分区只能投影到两个特征维度上。");
         }
 
         List<TrainingSimulationResponse.TreeNode> nodes = modelData.getTree();
@@ -317,17 +314,19 @@ public class TrainingSimulationService {
                     "决策树还没有完成第一次分裂（已展开 0 / " + splitCount + " 个节点）。");
         }
 
-        DataSet2d data = loadDataSet(dataset, null);
-        DataStats stats = new DataStats(data.points);
         List<List<List<Double>>> segments = new ArrayList<>();
-        collectTreeSegments(nodes, 0, revealed, stats.minX, stats.maxX, stats.minY, stats.maxY, segments);
+        collectTreeSegments(nodes, 0, revealed, xIndex, yIndex, data.means,
+                data.mins[xIndex], data.maxs[xIndex], data.mins[yIndex], data.maxs[yIndex], segments);
         if (segments.isEmpty()) {
-            return noProjection(projection, "当前树状态没有可绘制的分区线。");
+            return noProjection(projection,
+                    "该平面没有切到已展开的分裂（其余维度取均值后预测恒定），所以画不出分区线。");
         }
+        int hidden = Math.max(0, data.featureCount() - 2);
         projection.setKind(ProjectionDTO.KIND_DECISION_BOUNDARY);
         projection.setLines(segments);
-        projection.setNote("贪心决策树已展开 " + revealed + " / " + splitCount
-                + " 个节点（仍在 " + trainingLabel + " 两维上训练），一次单步只分裂一个节点。");
+        projection.setNote("全维度贪心决策树（" + data.featureCount() + " 维特征）在 "
+                + xName + " / " + yName + " 平面上的投影：其余 " + hidden + " 个维度固定在各自的均值；"
+                + "已展开 " + revealed + " / " + splitCount + " 个节点，一次单步只分裂一个节点。");
         return projection;
     }
 
@@ -462,11 +461,17 @@ public class TrainingSimulationService {
                 int idx = (int) Math.floor(Math.random() * data.points.size());
                 sample.add(data.points.get(idx));
             }
-            DecisionSplit split = findGreedySplit(sample, getDecisionTreeConfig(parameters));
+            // 随机森林仍按两维训练，这里把样本转成通用的树行（特征名固定 x / y）
+            List<DataRow> sampleRows = new ArrayList<>(sample.size());
+            for (DataPoint2d point : sample) {
+                sampleRows.add(new DataRow(
+                        new double[] {point.x, point.y}, point.target, point.classValue, point.classIndex));
+            }
+            DecisionSplit split = findGreedySplit(sampleRows, RF_TREE_FEATURES, getDecisionTreeConfig(parameters));
             if (split == null) {
                 // 这份 bootstrap 样本没有可用的分裂，退化成"两边都投多数类"
-                int majority = majorityClass(sample);
-                split = new DecisionSplit("x", 0.0, 0.0, majority, majority);
+                int majority = rowsMajorityClass(sampleRows);
+                split = new DecisionSplit("x", 0, 0.0, 0.0, majority, majority);
             }
             trees.add(split);
             featureUsed.add(split.feature());
@@ -642,11 +647,6 @@ public class TrainingSimulationService {
             modelData.setWeights(Arrays.asList(0.0, 0.0));
             modelData.setBias(0.0);
             modelData.setDecisionBoundary(buildLinearBoundary(stats, List.of(0.0, 0.0), 0.0));
-        } else if ("decision_tree".equals(name)) {
-            // 初始化时一棵树都还没展开（0 次分裂），第一次单步才会分出根节点
-            List<TrainingSimulationResponse.TreeNode> nodes =
-                    buildDecisionTree(data.points, getDecisionTreeConfig(parameters));
-            applyTreeState(modelData, stats, nodes, 0);
         } else if ("classification".equals(type)) {
             modelData.setWeights(Arrays.asList(0.0, 0.0));
             modelData.setBias(0.0);
@@ -661,16 +661,17 @@ public class TrainingSimulationService {
     }
 
     /**
-     * 本轮已完成全维度改造的算法：线性回归、逻辑回归、K-Means。
-     * 决策树与 SVM 仍按 {@link #loadDataSet} 选出的两维训练，等后续单独升级。
+     * 已完成全维度改造的算法：线性回归、逻辑回归、K-Means、决策树。
+     * SVM 与随机森林仍按 {@link #loadDataSet} 选出的两维训练，等后续单独升级。
      */
     private boolean isFullDimensionAlgorithm(String name, String type) {
-        if ("svm".equals(name) || "decision_tree".equals(name) || "random_forest".equals(name)) {
+        if ("svm".equals(name) || "random_forest".equals(name)) {
             return false;
         }
         return "linear_regression".equals(name)
                 || "logistic_regression".equals(name)
                 || "kmeans".equals(name)
+                || "decision_tree".equals(name)
                 || "regression".equals(type)
                 || "classification".equals(type)
                 || "clustering".equals(type);
@@ -682,6 +683,15 @@ public class TrainingSimulationService {
             String type,
             Dataset dataset,
             String parameters) {
+        if ("decision_tree".equals(name)) {
+            DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+            applyMatrixMetadata(modelData, data, "decision_tree");
+            // 初始化时一棵树都还没展开（0 次分裂），第一次单步才会分出根节点
+            List<TrainingSimulationResponse.TreeNode> nodes =
+                    buildDecisionTree(data.rows, data.featureNames, getDecisionTreeConfig(parameters));
+            applyTreeState(modelData, nodes, 0);
+            return modelData;
+        }
         if ("kmeans".equals(name) || "clustering".equals(type)) {
             DataMatrix data = loadDataMatrix(dataset, TargetMode.NONE);
             applyMatrixMetadata(modelData, data, "kmeans");
@@ -731,9 +741,11 @@ public class TrainingSimulationService {
         if (session.getModelData() != null && !session.getModelData().isBlank()) {
             TrainingSimulationResponse.ModelData modelData =
                     fromJson(session.getModelData(), TrainingSimulationResponse.ModelData.class);
-            // 旧格式会话（没有树结构）无法继续按"每次分裂"推进，按当前参数重建
+            // 旧格式会话（没有树结构，或还是两维训练的树）无法继续按"每次分裂"推进，按当前参数重建
             if ("decision_tree".equals(algorithm.getName())
-                    && (modelData.getTree() == null || modelData.getTree().isEmpty())) {
+                    && (!"decision_tree".equals(modelData.getModelKind())
+                        || modelData.getTree() == null
+                        || modelData.getTree().isEmpty())) {
                 return initializeModelData(algorithm, dataset, session.getParameters());
             }
             return modelData;
@@ -957,12 +969,11 @@ public class TrainingSimulationService {
      * 之后每一步只把 revealedSplits 加一，因此暂停时模型恰好停在最近一次分裂的状态。
      */
     private StepResult trainDecisionTree(Dataset dataset, String parameters, TrainingSimulationResponse.ModelData modelData) {
-        DataSet2d data = loadDataSet(dataset, null);
-        DataStats stats = new DataStats(data.points);
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
         DecisionTreeConfig config = getDecisionTreeConfig(parameters);
         List<TrainingSimulationResponse.TreeNode> nodes = modelData.getTree();
         if (nodes == null || nodes.isEmpty()) {
-            nodes = buildDecisionTree(data.points, config);
+            nodes = buildDecisionTree(data.rows, data.featureNames, config);
             modelData.setTree(nodes);
             modelData.setRevealedSplits(0);
         }
@@ -971,55 +982,56 @@ public class TrainingSimulationService {
         if (revealed < splitCount) {
             revealed += 1; // 一次分裂
         }
-        applyTreeState(modelData, stats, nodes, revealed);
+        applyTreeState(modelData, nodes, revealed);
         return evaluateDecisionTree(dataset, parameters, modelData);
     }
 
     private StepResult evaluateDecisionTree(Dataset dataset, String parameters, TrainingSimulationResponse.ModelData modelData) {
-        DataSet2d data = loadDataSet(dataset, null);
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
         DecisionTreeConfig config = getDecisionTreeConfig(parameters);
         List<TrainingSimulationResponse.TreeNode> nodes = modelData.getTree();
         if (nodes == null || nodes.isEmpty()) {
-            nodes = buildDecisionTree(data.points, config);
-            modelData.setTree(nodes);
-            modelData.setRevealedSplits(0);
+            nodes = buildDecisionTree(data.rows, data.featureNames, config);
+            applyTreeState(modelData, nodes, 0);
         }
         int revealed = modelData.getRevealedSplits() == null ? 0 : modelData.getRevealedSplits();
 
         int correct = 0;
         double impuritySum = 0.0;
-        for (DataPoint2d point : data.points) {
-            TrainingSimulationResponse.TreeNode terminal = terminalNode(nodes, revealed, point);
+        for (DataRow row : data.rows) {
+            TrainingSimulationResponse.TreeNode terminal = terminalNode(nodes, revealed, row);
             Integer predicted = terminal.getClassIndex();
-            if (predicted != null && predicted == point.classIndex) {
+            if (predicted != null && predicted == row.classIndex()) {
                 correct += 1;
             }
             impuritySum += terminal.getImpurity() == null ? 0.0 : terminal.getImpurity();
         }
-        int n = Math.max(1, data.points.size());
-        double accuracy = data.points.isEmpty() ? 0.0 : (double) correct / data.points.size();
+        int n = Math.max(1, data.rows.size());
+        double accuracy = data.rows.isEmpty() ? 0.0 : (double) correct / data.rows.size();
         // 损失取"叶节点不纯度的样本平均"，也就是当前这棵树真正达到的不纯度
         return new StepResult(modelData, round(impuritySum / n), round(accuracy), "Accuracy");
     }
 
     // ==================== 贪心决策树 ====================
 
-    private record PendingNode(int id, List<DataPoint2d> points) {}
+    private record PendingNode(int id, List<DataRow> rows) {}
 
     /**
      * 贪心建树：每个节点只做一次"当前最优的单次分裂"，然后对左右子集递归。
      * <p>
-     * 节点按 BFS 顺序编号与展开，所以 revealedSplits 逐个累加时，树是"一层层长"的。
+     * 在所有数值维度上搜索分裂；节点按 BFS 顺序编号与展开，
+     * 所以 revealedSplits 逐个累加时，树是"一层层长"的。
      * 代价 O(节点数 · 特征数 · 取值数 · 样本数)，与原先的前瞻搜索相比低了几个数量级。
      */
     private List<TrainingSimulationResponse.TreeNode> buildDecisionTree(
-            List<DataPoint2d> points,
+            List<DataRow> rows,
+            List<String> featureNames,
             DecisionTreeConfig config) {
         List<TrainingSimulationResponse.TreeNode> nodes = new ArrayList<>();
-        nodes.add(createTreeNode(0, 0, points, config));
+        nodes.add(createTreeNode(0, 0, rows, config));
 
         Deque<PendingNode> queue = new ArrayDeque<>();
-        queue.add(new PendingNode(0, points));
+        queue.add(new PendingNode(0, rows));
         int nextId = 1;
         int splitOrder = 0;
 
@@ -1027,24 +1039,26 @@ public class TrainingSimulationService {
             PendingNode pending = queue.poll();
             TrainingSimulationResponse.TreeNode node = nodes.get(pending.id());
             if (node.getDepth() >= config.maxDepth
-                    || pending.points().size() < config.minSamplesSplit) {
+                    || pending.rows().size() < config.minSamplesSplit) {
                 continue;
             }
-            DecisionSplit split = findGreedySplit(pending.points(), config);
+            DecisionSplit split = findGreedySplit(pending.rows(), featureNames, config);
             if (split == null) {
                 continue; // 没有能降低不纯度的分裂，保持叶子
             }
             node.setFeature(split.feature());
+            node.setFeatureIndex(split.featureIndex());
             node.setThreshold(round(split.threshold()));
             node.setSplitOrder(splitOrder++);
 
-            List<DataPoint2d> left = new ArrayList<>();
-            List<DataPoint2d> right = new ArrayList<>();
-            for (DataPoint2d point : pending.points()) {
-                if (isLeft(point, split.feature(), split.threshold())) {
-                    left.add(point);
+            List<DataRow> left = new ArrayList<>();
+            List<DataRow> right = new ArrayList<>();
+            int featureIndex = split.featureIndex();
+            for (DataRow row : pending.rows()) {
+                if (row.features()[featureIndex] <= split.threshold()) {
+                    left.add(row);
                 } else {
-                    right.add(point);
+                    right.add(row);
                 }
             }
             int leftId = nextId++;
@@ -1062,33 +1076,38 @@ public class TrainingSimulationService {
     private TrainingSimulationResponse.TreeNode createTreeNode(
             int id,
             int depth,
-            List<DataPoint2d> points,
+            List<DataRow> rows,
             DecisionTreeConfig config) {
         TrainingSimulationResponse.TreeNode node = new TrainingSimulationResponse.TreeNode();
         node.setId(id);
         node.setDepth(depth);
-        node.setImpurity(round(nodeImpurity(points, config)));
-        node.setClassIndex(majorityClass(points));
+        node.setImpurity(round(rowsImpurity(rows, config)));
+        node.setClassIndex(rowsMajorityClass(rows));
         node.setSplitOrder(-1);
         return node;
     }
 
-    /** 单个节点的贪心分裂：逐特征、逐阈值算加权不纯度，取最小者；没有改善就不分裂 */
-    private DecisionSplit findGreedySplit(List<DataPoint2d> points, DecisionTreeConfig config) {
-        if (points.size() < config.minSamplesSplit) {
+    /** 单个节点的贪心分裂：逐维度、逐阈值算加权不纯度，取最小者；没有改善就不分裂 */
+    private DecisionSplit findGreedySplit(
+            List<DataRow> rows,
+            List<String> featureNames,
+            DecisionTreeConfig config) {
+        if (rows.size() < config.minSamplesSplit) {
             return null;
         }
-        double parentImpurity = nodeImpurity(points, config);
+        double parentImpurity = rowsImpurity(rows, config);
         DecisionSplit best = null;
-        for (String feature : List.of("x", "y")) {
-            List<Double> values = points.stream()
-                    .map(point -> "x".equals(feature) ? point.x : point.y)
+        for (int featureIndex = 0; featureIndex < featureNames.size(); featureIndex++) {
+            final int index = featureIndex;
+            List<Double> values = rows.stream()
+                    .map(row -> row.features()[index])
                     .distinct()
                     .sorted()
                     .toList();
-            for (int index = 0; index < values.size() - 1; index++) {
-                double threshold = (values.get(index) + values.get(index + 1)) / 2.0;
-                DecisionSplit candidate = buildDecisionSplit(points, feature, threshold, config);
+            for (int i = 0; i < values.size() - 1; i++) {
+                double threshold = (values.get(i) + values.get(i + 1)) / 2.0;
+                DecisionSplit candidate = buildDecisionSplit(
+                        rows, featureNames.get(index), index, threshold, config);
                 if (candidate == null) {
                     continue;
                 }
@@ -1101,6 +1120,39 @@ public class TrainingSimulationService {
             return null;
         }
         return best;
+    }
+
+    private DecisionSplit buildDecisionSplit(
+            List<DataRow> rows,
+            String feature,
+            int featureIndex,
+            double threshold,
+            DecisionTreeConfig config) {
+        Map<Integer, Integer> leftCounts = new HashMap<>();
+        Map<Integer, Integer> rightCounts = new HashMap<>();
+        int leftCount = 0;
+        int rightCount = 0;
+        for (DataRow row : rows) {
+            if (row.features()[featureIndex] <= threshold) {
+                leftCount += 1;
+                leftCounts.merge(row.classIndex(), 1, Integer::sum);
+            } else {
+                rightCount += 1;
+                rightCounts.merge(row.classIndex(), 1, Integer::sum);
+            }
+        }
+        if (leftCount == 0 || rightCount == 0) {
+            return null; // 阈值落在数据范围外，不是有效分裂
+        }
+        double impurity = ((double) leftCount / rows.size()) * nodeImpurity(leftCounts, leftCount, config)
+                + ((double) rightCount / rows.size()) * nodeImpurity(rightCounts, rightCount, config);
+        return new DecisionSplit(
+                feature,
+                featureIndex,
+                threshold,
+                impurity,
+                majorityClass(leftCounts),
+                majorityClass(rightCounts));
     }
 
     private int countSplits(List<TrainingSimulationResponse.TreeNode> nodes) {
@@ -1120,12 +1172,13 @@ public class TrainingSimulationService {
     private TrainingSimulationResponse.TreeNode terminalNode(
             List<TrainingSimulationResponse.TreeNode> nodes,
             int revealed,
-            DataPoint2d point) {
+            DataRow row) {
         TrainingSimulationResponse.TreeNode node = nodes.get(0);
         int guard = 0;
         while (guard++ < nodes.size()) {
+            Integer featureIndex = node.getFeatureIndex();
             Integer splitOrder = node.getSplitOrder();
-            if (node.getFeature() == null
+            if (featureIndex == null
                     || node.getLeftId() == null
                     || node.getRightId() == null
                     || splitOrder == null
@@ -1133,20 +1186,14 @@ public class TrainingSimulationService {
                     || splitOrder >= revealed) {
                 return node;
             }
-            int nextId = isLeft(point, node.getFeature(), node.getThreshold())
-                    ? node.getLeftId()
-                    : node.getRightId();
-            if (nextId < 0 || nextId >= nodes.size()) {
-                return node;
-            }
-            node = nodes.get(nextId);
+            boolean left = row.features()[featureIndex] <= node.getThreshold();
+            node = nodes.get(left ? node.getLeftId() : node.getRightId());
         }
         return node;
     }
 
     private void applyTreeState(
             TrainingSimulationResponse.ModelData modelData,
-            DataStats stats,
             List<TrainingSimulationResponse.TreeNode> nodes,
             int revealed) {
         int safeRevealed = Math.max(0, Math.min(revealed, countSplits(nodes)));
@@ -1157,33 +1204,26 @@ public class TrainingSimulationService {
             modelData.setSplitFeature(root.getFeature());
             modelData.setSplitThreshold(root.getThreshold());
             modelData.setSplitImpurity(root.getImpurity());
-            modelData.setDecisionBoundary(rootBoundary(stats, root));
         } else {
             modelData.setSplitFeature(null);
             modelData.setSplitThreshold(null);
             modelData.setSplitImpurity(null);
-            modelData.setDecisionBoundary(null);
         }
+        // 树的分区可能由多条线段组成，统一由投影接口给出
+        modelData.setDecisionBoundary(null);
     }
 
-    /** 兼容旧的二维边界字段：只画根节点的分裂线 */
-    private List<List<Double>> rootBoundary(DataStats stats, TrainingSimulationResponse.TreeNode root) {
-        double threshold = root.getThreshold() == null ? 0.0 : root.getThreshold();
-        if ("x".equals(root.getFeature())) {
-            return Arrays.asList(
-                    Arrays.asList(round(threshold), round(stats.minY)),
-                    Arrays.asList(round(threshold), round(stats.maxY)));
-        }
-        return Arrays.asList(
-                Arrays.asList(round(stats.minX), round(threshold)),
-                Arrays.asList(round(stats.maxX), round(threshold)));
-    }
-
-    /** 把已展开节点的分裂线收集成轴对齐的线段（按父节点的包围盒延伸） */
+    /**
+     * 把已展开节点的分裂线收集成轴对齐线段，得到树在 (xIndex, yIndex) 平面上的切片。
+     * 隐藏维度固定在其均值：遇到隐藏维度的分裂时按"均值 vs 阈值"选一边继续下降，不再产生线段。
+     */
     private void collectTreeSegments(
             List<TrainingSimulationResponse.TreeNode> nodes,
             int nodeIndex,
             int revealed,
+            int xIndex,
+            int yIndex,
+            double[] featureMeans,
             double minX,
             double maxX,
             double minY,
@@ -1193,8 +1233,9 @@ public class TrainingSimulationService {
             return;
         }
         TrainingSimulationResponse.TreeNode node = nodes.get(nodeIndex);
+        Integer featureIndex = node.getFeatureIndex();
         Integer splitOrder = node.getSplitOrder();
-        if (node.getFeature() == null
+        if (featureIndex == null
                 || node.getLeftId() == null
                 || node.getRightId() == null
                 || splitOrder == null
@@ -1203,19 +1244,45 @@ public class TrainingSimulationService {
             return;
         }
         double threshold = node.getThreshold() == null ? 0.0 : node.getThreshold();
-        if ("x".equals(node.getFeature())) {
+        if (featureIndex == xIndex) {
             segments.add(Arrays.asList(
                     Arrays.asList(round(threshold), round(minY)),
                     Arrays.asList(round(threshold), round(maxY))));
-            collectTreeSegments(nodes, node.getLeftId(), revealed, minX, threshold, minY, maxY, segments);
-            collectTreeSegments(nodes, node.getRightId(), revealed, threshold, maxX, minY, maxY, segments);
-        } else {
+            collectTreeSegments(nodes, node.getLeftId(), revealed, xIndex, yIndex,
+                    featureMeans, minX, threshold, minY, maxY, segments);
+            collectTreeSegments(nodes, node.getRightId(), revealed, xIndex, yIndex,
+                    featureMeans, threshold, maxX, minY, maxY, segments);
+        } else if (featureIndex == yIndex) {
             segments.add(Arrays.asList(
                     Arrays.asList(round(minX), round(threshold)),
                     Arrays.asList(round(maxX), round(threshold))));
-            collectTreeSegments(nodes, node.getLeftId(), revealed, minX, maxX, minY, threshold, segments);
-            collectTreeSegments(nodes, node.getRightId(), revealed, minX, maxX, threshold, maxY, segments);
+            collectTreeSegments(nodes, node.getLeftId(), revealed, xIndex, yIndex,
+                    featureMeans, minX, maxX, minY, threshold, segments);
+            collectTreeSegments(nodes, node.getRightId(), revealed, xIndex, yIndex,
+                    featureMeans, minX, maxX, threshold, maxY, segments);
+        } else {
+            int childId = featureMeans[featureIndex] <= threshold
+                    ? node.getLeftId()
+                    : node.getRightId();
+            collectTreeSegments(nodes, childId, revealed, xIndex, yIndex,
+                    featureMeans, minX, maxX, minY, maxY, segments);
         }
+    }
+
+    private double rowsImpurity(List<DataRow> rows, DecisionTreeConfig config) {
+        Map<Integer, Integer> counts = new HashMap<>();
+        for (DataRow row : rows) {
+            counts.merge(row.classIndex(), 1, Integer::sum);
+        }
+        return nodeImpurity(counts, rows.size(), config);
+    }
+
+    private int rowsMajorityClass(List<DataRow> rows) {
+        Map<Integer, Integer> counts = new HashMap<>();
+        for (DataRow row : rows) {
+            counts.merge(row.classIndex(), 1, Integer::sum);
+        }
+        return majorityClass(counts);
     }
 
     private StepResult trainSvm(Dataset dataset, String parameters, TrainingSimulationResponse.ModelData modelData) {
@@ -1967,44 +2034,8 @@ public class TrainingSimulationService {
         return updated;
     }
 
-    private DecisionSplit buildDecisionSplit(List<DataPoint2d> points, String feature, double threshold, DecisionTreeConfig config) {
-        Map<Integer, Integer> leftCounts = new HashMap<>();
-        Map<Integer, Integer> rightCounts = new HashMap<>();
-        int leftCount = 0;
-        int rightCount = 0;
-        for (DataPoint2d point : points) {
-            boolean left = ("x".equals(feature) ? point.x : point.y) <= threshold;
-            if (left) {
-                leftCount += 1;
-                leftCounts.merge(point.classIndex, 1, Integer::sum);
-            } else {
-                rightCount += 1;
-                rightCounts.merge(point.classIndex, 1, Integer::sum);
-            }
-        }
-        if (leftCount == 0 || rightCount == 0) {
-            return null; // 阈值落在数据范围外，不是有效分裂
-        }
-        double impurity = ((double) leftCount / points.size()) * nodeImpurity(leftCounts, leftCount, config)
-                + ((double) rightCount / points.size()) * nodeImpurity(rightCounts, rightCount, config);
-        return new DecisionSplit(
-                feature,
-                threshold,
-                impurity,
-                majorityClass(leftCounts),
-                majorityClass(rightCounts));
-    }
-
     private boolean isLeft(DataPoint2d point, String feature, double threshold) {
         return ("x".equals(feature) ? point.x : point.y) <= threshold;
-    }
-
-    private double nodeImpurity(List<DataPoint2d> points, DecisionTreeConfig config) {
-        Map<Integer, Integer> counts = new HashMap<>();
-        for (DataPoint2d point : points) {
-            counts.merge(point.classIndex, 1, Integer::sum);
-        }
-        return nodeImpurity(counts, points.size(), config);
     }
 
     private double nodeImpurity(Map<Integer, Integer> counts, int count, DecisionTreeConfig config) {
@@ -2036,14 +2067,6 @@ public class TrainingSimulationService {
             impurity -= p * (Math.log(p) / Math.log(2.0));
         }
         return impurity;
-    }
-
-    private int majorityClass(List<DataPoint2d> points) {
-        Map<Integer, Integer> counts = new HashMap<>();
-        for (DataPoint2d point : points) {
-            counts.merge(point.classIndex, 1, Integer::sum);
-        }
-        return majorityClass(counts);
     }
 
     private int majorityClass(Map<Integer, Integer> counts) {
@@ -2616,7 +2639,13 @@ public class TrainingSimulationService {
 
     private record DataSet2d(List<DataPoint2d> points) {}
 
-    private record DecisionSplit(String feature, double threshold, double impurity, int leftClassIndex, int rightClassIndex) {}
+    private record DecisionSplit(
+            String feature,
+            int featureIndex,
+            double threshold,
+            double impurity,
+            int leftClassIndex,
+            int rightClassIndex) {}
 
     private record DecisionTreeConfig(int maxDepth, int minSamplesSplit, String criterion) {}
 

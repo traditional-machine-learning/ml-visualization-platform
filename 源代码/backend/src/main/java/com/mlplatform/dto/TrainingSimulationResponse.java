@@ -163,6 +163,8 @@ public class TrainingSimulationResponse {
         private Integer depth;
         /** null 表示这是叶子 */
         private String feature;
+        /** 该特征在 ModelData.featureNames 里的下标，用于按行取值向下路由 */
+        private Integer featureIndex;
         private Double threshold;
         /** 该节点自身的不纯度（展开成叶子时也用它作为这部分数据的损失） */
         private Double impurity;
@@ -179,6 +181,8 @@ public class TrainingSimulationResponse {
         public void setDepth(Integer depth) { this.depth = depth; }
         public String getFeature() { return feature; }
         public void setFeature(String feature) { this.feature = feature; }
+        public Integer getFeatureIndex() { return featureIndex; }
+        public void setFeatureIndex(Integer featureIndex) { this.featureIndex = featureIndex; }
         public Double getThreshold() { return threshold; }
         public void setThreshold(Double threshold) { this.threshold = threshold; }
         public Double getImpurity() { return impurity; }
