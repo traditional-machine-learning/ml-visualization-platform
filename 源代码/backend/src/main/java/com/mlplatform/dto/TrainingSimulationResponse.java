@@ -82,6 +82,12 @@ public class TrainingSimulationResponse {
         /** 贪心决策树的完整节点表（按 BFS 顺序编号）；revealedSplits 之前的分裂才是"当前已展开"的部分 */
         private List<TreeNode> tree;
         private Integer revealedSplits;
+        /** 随机森林：每个样本的累计投票数（行下标 → 各类别票数），每训练一棵树就累加 */
+        private List<List<Integer>> voteCounts;
+        /** 随机森林：各维度的重要性累加值（与 featureNames 对齐，每棵树归一到 1 后相加） */
+        private List<Double> importanceSums;
+        /** 随机森林：已经训练完的树的数量 */
+        private Integer treeCount;
         private List<Integer> assignments;
         private String splitFeature;
         private Double splitThreshold;
@@ -112,6 +118,12 @@ public class TrainingSimulationResponse {
         public void setTree(List<TreeNode> tree) { this.tree = tree; }
         public Integer getRevealedSplits() { return revealedSplits; }
         public void setRevealedSplits(Integer revealedSplits) { this.revealedSplits = revealedSplits; }
+        public List<List<Integer>> getVoteCounts() { return voteCounts; }
+        public void setVoteCounts(List<List<Integer>> voteCounts) { this.voteCounts = voteCounts; }
+        public List<Double> getImportanceSums() { return importanceSums; }
+        public void setImportanceSums(List<Double> importanceSums) { this.importanceSums = importanceSums; }
+        public Integer getTreeCount() { return treeCount; }
+        public void setTreeCount(Integer treeCount) { this.treeCount = treeCount; }
         public List<Integer> getAssignments() { return assignments; }
         public void setAssignments(List<Integer> assignments) { this.assignments = assignments; }
         public String getSplitFeature() { return splitFeature; }
@@ -172,6 +184,8 @@ public class TrainingSimulationResponse {
         private Double threshold;
         /** 该节点自身的不纯度（展开成叶子时也用它作为这部分数据的损失） */
         private Double impurity;
+        /** 落到该节点的样本数，用于按样本占比加权计算特征重要性 */
+        private Integer samples;
         /** 该节点的多数类；节点尚未展开时就以它作为预测 */
         private Integer classIndex;
         private Integer leftId;
@@ -191,6 +205,8 @@ public class TrainingSimulationResponse {
         public void setThreshold(Double threshold) { this.threshold = threshold; }
         public Double getImpurity() { return impurity; }
         public void setImpurity(Double impurity) { this.impurity = impurity; }
+        public Integer getSamples() { return samples; }
+        public void setSamples(Integer samples) { this.samples = samples; }
         public Integer getClassIndex() { return classIndex; }
         public void setClassIndex(Integer classIndex) { this.classIndex = classIndex; }
         public Integer getLeftId() { return leftId; }

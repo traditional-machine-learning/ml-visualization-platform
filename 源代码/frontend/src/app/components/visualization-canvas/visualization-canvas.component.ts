@@ -439,8 +439,8 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   private resolvePointLabel(label?: string, clusterId?: number, index?: number): string {
     const assignment = this.resolveAssignment(index);
     if (assignment !== undefined) {
-      // 决策树：按当前（已展开的）树给出的预测类别着色，实时反映分类结果
-      if (this.isDecisionTree) {
+      // 决策树 / 随机森林：按当前模型的预测类别着色，实时反映分类结果
+      if (this.usesPredictionColoring) {
         return this.predictionLabel(assignment);
       }
       return `聚类 ${assignment + 1}`;
@@ -454,8 +454,9 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     return 'Samples';
   }
 
-  private get isDecisionTree(): boolean {
-    return this.trainingState?.modelData?.modelKind === 'decision_tree';
+  private get usesPredictionColoring(): boolean {
+    const kind = this.trainingState?.modelData?.modelKind;
+    return kind === 'decision_tree' || kind === 'random_forest';
   }
 
   private predictionLabel(classIndex: number): string {

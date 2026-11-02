@@ -15,18 +15,20 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 
 @Service
 public class TrainingSimulationService {
     private static final int DEFAULT_TOTAL_STEPS = 100;
     private static final double EPSILON = 1.0e-9;
-    /** 随机森林仍按两维训练，树行里的特征名固定为 x / y */
-    private static final List<String> RF_TREE_FEATURES = List.of("x", "y");
+    /** 随机森林的固定随机种子：同样的数据与参数下结果可复现 */
+    private static final long FOREST_SEED = 20_240_517L;
 
     private final AlgorithmRepository algorithmRepository;
     private final DatasetRepository datasetRepository;
@@ -179,6 +181,10 @@ public class TrainingSimulationService {
         if ("decision_tree".equals(name)) {
             return projectDecisionTree(dataset, modelData, projection, xName, yName);
         }
+        // 随机森林由多棵树投票，分区无法直接投影，只按预测类别着色
+        if ("random_forest".equals(name)) {
+            return projectRandomForest(projection);
+        }
         // 与训练侧用同一个判定，保证"全维训练"和"能投影"永远一致
         if (!isFullDimensionAlgorithm(name, type)) {
             return projectLegacy(dataset, modelData, projection, name, xName, yName);
@@ -289,6 +295,17 @@ public class TrainingSimulationService {
         projection.setAssignments(modelData.getAssignments());
         projection.setNote("K-Means 在 " + data.featureCount() + " 维空间中聚类，"
                 + "这里只取质心在当前两维上的坐标；点的颜色仍是全维聚类结果。");
+        return projection;
+    }
+
+    /** 随机森林：多棵树的决策分区没有二维闭式表示，因此不画分区线，只靠样本的预测类别着色 */
+    private ProjectionDTO projectRandomForest(ProjectionDTO projection) {
+        projection.setKind(ProjectionDTO.KIND_NONE);
+        projection.setLines(null);
+        projection.setCentroids(null);
+        projection.setAssignments(null);
+        projection.setNote("随机森林的预测结果按样本着色显示；多棵树的决策分区无法直接投影到二维平面，"
+                + "因此不绘制分区线，想看单个模型的分区可以切换到决策树。");
         return projection;
     }
 
@@ -446,76 +463,30 @@ public class TrainingSimulationService {
         return response;
     }
 
+    /**
+     * 一次性训练完整森林（对比页 / 兼容旧调用）。
+     * 正式训练走会话流程：一步训练一棵树，见 {@link #trainRandomForestStep}。
+     */
     public TrainingSimulationResponse startRandomForest(Long algorithmId, Long datasetId, String parameters) {
         Algorithm algorithm = requireAlgorithm(algorithmId);
         Dataset dataset = requireDataset(datasetId);
-        int nEstimators = clampInt(getNumericParameter(parameters, "n_estimators", 5), 1, 20);
-
-        DataSet2d data = loadDataSet(dataset, algorithm);
-        List<DecisionSplit> trees = new ArrayList<>();
-        List<String> featureUsed = new ArrayList<>();
-        for (int t = 0; t < nEstimators; t++) {
-            // bootstrap sample indices
-            List<DataPoint2d> sample = new ArrayList<>();
-            for (int i = 0; i < data.points.size(); i++) {
-                int idx = (int) Math.floor(Math.random() * data.points.size());
-                sample.add(data.points.get(idx));
-            }
-            // 随机森林仍按两维训练，这里把样本转成通用的树行（特征名固定 x / y）
-            List<DataRow> sampleRows = new ArrayList<>(sample.size());
-            for (DataPoint2d point : sample) {
-                sampleRows.add(new DataRow(
-                        new double[] {point.x, point.y}, point.target, point.classValue, point.classIndex));
-            }
-            DecisionSplit split = findGreedySplit(sampleRows, RF_TREE_FEATURES, getDecisionTreeConfig(parameters));
-            if (split == null) {
-                // 这份 bootstrap 样本没有可用的分裂，退化成"两边都投多数类"
-                int majority = rowsMajorityClass(sampleRows);
-                split = new DecisionSplit("x", 0, 0.0, 0.0, majority, majority);
-            }
-            trees.add(split);
-            featureUsed.add(split.feature());
-        }
-
-        // aggregate predictions
-        int correct = 0;
-        for (DataPoint2d point : data.points) {
-            Map<Integer, Integer> votes = new HashMap<>();
-            for (DecisionSplit split : trees) {
-                int pred = isLeft(point, split.feature, split.threshold) ? split.leftClassIndex : split.rightClassIndex;
-                votes.merge(pred, 1, Integer::sum);
-            }
-            int finalPred = votes.entrySet().stream().max((a, b) -> Integer.compare(a.getValue(), b.getValue())).map(Map.Entry::getKey).orElse(0);
-            if (finalPred == point.classIndex) correct += 1;
-        }
-        double accuracy = data.points.isEmpty() ? 0.0 : (double) correct / data.points.size();
-
-        // feature importances (frequency)
-        Map<String, Integer> freq = new HashMap<>();
-        for (String f : featureUsed) freq.merge(f, 1, Integer::sum);
-        List<TrainingSimulationResponse.FeatureImportance> importances = new ArrayList<>();
-        int total = trees.size() == 0 ? 1 : trees.size();
-        for (String f : List.of("x", "y")) {
-            double imp = freq.getOrDefault(f, 0) / (double) total;
-            TrainingSimulationResponse.FeatureImportance fi = new TrainingSimulationResponse.FeatureImportance();
-            fi.setFeature(f);
-            fi.setImportance(round(imp));
-            importances.add(fi);
-        }
+        String normalizedParams = normalizeParameters(parameters);
 
         TrainingSimulationResponse.ModelData modelData = new TrainingSimulationResponse.ModelData();
-        modelData.setFeatureImportances(importances);
+        int treeCount = forestSize(normalizedParams);
+        buildRandomForest(dataset, normalizedParams, modelData, treeCount);
+        StepResult result = evaluateRandomForest(dataset, normalizedParams, modelData);
 
         TrainingSimulationResponse response = new TrainingSimulationResponse();
         response.setAlgorithmId(algorithmId);
         response.setDatasetId(datasetId);
         response.setStatus("completed");
-        response.setCurrentStep(0);
-        response.setTotalSteps(0);
-        response.setLoss(0.0);
-        response.setAccuracy(round(accuracy));
-        response.setScoreLabel("Accuracy");
-        response.setModelData(modelData);
+        response.setCurrentStep(treeCount);
+        response.setTotalSteps(treeCount);
+        response.setLoss(round(result.loss));
+        response.setAccuracy(round(result.score));
+        response.setScoreLabel(result.scoreLabel);
+        response.setModelData(result.modelData);
         return response;
     }
 
@@ -556,6 +527,10 @@ public class TrainingSimulationService {
         if ("decision_tree".equals(algorithm.getName()) && modelData.getTree() != null) {
             // 这个面板是一次性评估，直接展示整棵树的结果（单步训练语义只影响正式训练）
             modelData.setRevealedSplits(countSplits(modelData.getTree()));
+        }
+        if ("random_forest".equals(algorithm.getName())) {
+            // 同理：一次性把森林训练完再评估
+            buildRandomForest(tmp, "{}", modelData, forestSize("{}"));
         }
         StepResult result = evaluateCurrentState(algorithm, tmp, parameters, modelData);
 
@@ -665,13 +640,14 @@ public class TrainingSimulationService {
      * SVM 与随机森林仍按 {@link #loadDataSet} 选出的两维训练，等后续单独升级。
      */
     private boolean isFullDimensionAlgorithm(String name, String type) {
-        if ("svm".equals(name) || "random_forest".equals(name)) {
+        if ("svm".equals(name)) {
             return false;
         }
         return "linear_regression".equals(name)
                 || "logistic_regression".equals(name)
                 || "kmeans".equals(name)
                 || "decision_tree".equals(name)
+                || "random_forest".equals(name)
                 || "regression".equals(type)
                 || "classification".equals(type)
                 || "clustering".equals(type);
@@ -690,6 +666,15 @@ public class TrainingSimulationService {
             List<TrainingSimulationResponse.TreeNode> nodes =
                     buildDecisionTree(data.rows, data.featureNames, getDecisionTreeConfig(parameters));
             applyTreeState(modelData, nodes, 0);
+            return modelData;
+        }
+        if ("random_forest".equals(name)) {
+            DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+            applyMatrixMetadata(modelData, data, "random_forest");
+            // 初始化时一棵树都还没有，第一次单步才会训练第一棵
+            modelData.setTreeCount(0);
+            modelData.setVoteCounts(emptyVotes(data));
+            modelData.setImportanceSums(zeroWeights(data.featureCount()));
             return modelData;
         }
         if ("kmeans".equals(name) || "clustering".equals(type)) {
@@ -749,6 +734,12 @@ public class TrainingSimulationService {
                         || modelData.getTree().isEmpty())) {
                 return initializeModelData(algorithm, dataset, session.getParameters());
             }
+            // 随机森林同理：旧会话里没有投票状态，重建
+            if ("random_forest".equals(algorithm.getName())
+                    && (!"random_forest".equals(modelData.getModelKind())
+                        || modelData.getVoteCounts() == null)) {
+                return initializeModelData(algorithm, dataset, session.getParameters());
+            }
             return modelData;
         }
         return initializeModelData(algorithm, dataset, session.getParameters());
@@ -773,6 +764,9 @@ public class TrainingSimulationService {
         }
         if ("decision_tree".equals(name)) {
             return trainDecisionTree(dataset, parameters, modelData);
+        }
+        if ("random_forest".equals(name)) {
+            return trainRandomForestStep(dataset, parameters, modelData);
         }
         if ("svm".equals(name)) {
             return trainSvm(dataset, parameters, modelData);
@@ -802,6 +796,9 @@ public class TrainingSimulationService {
         }
         if ("decision_tree".equals(name)) {
             return evaluateDecisionTree(dataset, parameters, modelData);
+        }
+        if ("random_forest".equals(name)) {
+            return evaluateRandomForest(dataset, parameters, modelData);
         }
         if ("svm".equals(name)) {
             return evaluateSvm(dataset, parameters, modelData);
@@ -1032,6 +1029,18 @@ public class TrainingSimulationService {
             List<DataRow> rows,
             List<String> featureNames,
             DecisionTreeConfig config) {
+        return buildDecisionTree(rows, featureNames, config, null);
+    }
+
+    /**
+     * @param random 为 null 时每个节点用全部维度（普通决策树）；
+     *               非 null 时每个节点随机抽 sqrt(m) 个维度（随机森林）
+     */
+    private List<TrainingSimulationResponse.TreeNode> buildDecisionTree(
+            List<DataRow> rows,
+            List<String> featureNames,
+            DecisionTreeConfig config,
+            Random random) {
         List<TrainingSimulationResponse.TreeNode> nodes = new ArrayList<>();
         nodes.add(createTreeNode(0, 0, rows, config));
 
@@ -1047,7 +1056,10 @@ public class TrainingSimulationService {
                     || pending.rows().size() < config.minSamplesSplit) {
                 continue;
             }
-            DecisionSplit split = findGreedySplit(pending.rows(), featureNames, config);
+            List<Integer> candidates = random == null
+                    ? null
+                    : randomFeatureSubset(featureNames.size(), random);
+            DecisionSplit split = findGreedySplit(pending.rows(), featureNames, config, candidates);
             if (split == null) {
                 continue; // 没有能降低不纯度的分裂，保持叶子
             }
@@ -1086,6 +1098,7 @@ public class TrainingSimulationService {
         TrainingSimulationResponse.TreeNode node = new TrainingSimulationResponse.TreeNode();
         node.setId(id);
         node.setDepth(depth);
+        node.setSamples(rows.size());
         node.setImpurity(round(rowsImpurity(rows, config)));
         node.setClassIndex(rowsMajorityClass(rows));
         node.setSplitOrder(-1);
@@ -1097,12 +1110,25 @@ public class TrainingSimulationService {
             List<DataRow> rows,
             List<String> featureNames,
             DecisionTreeConfig config) {
+        return findGreedySplit(rows, featureNames, config, null);
+    }
+
+    private DecisionSplit findGreedySplit(
+            List<DataRow> rows,
+            List<String> featureNames,
+            DecisionTreeConfig config,
+            List<Integer> candidateFeatures) {
         if (rows.size() < config.minSamplesSplit) {
             return null;
         }
         double parentImpurity = rowsImpurity(rows, config);
         DecisionSplit best = null;
-        for (int featureIndex = 0; featureIndex < featureNames.size(); featureIndex++) {
+        int candidateCount = candidateFeatures == null ? featureNames.size() : candidateFeatures.size();
+        for (int position = 0; position < candidateCount; position++) {
+            int featureIndex = candidateFeatures == null ? position : candidateFeatures.get(position);
+            if (featureIndex < 0 || featureIndex >= featureNames.size()) {
+                continue;
+            }
             final int index = featureIndex;
             List<Double> values = rows.stream()
                     .map(row -> row.features()[index])
@@ -1288,6 +1314,290 @@ public class TrainingSimulationService {
             counts.merge(row.classIndex(), 1, Integer::sum);
         }
         return majorityClass(counts);
+    }
+
+    // ==================== 随机森林：一步训练一棵树 ====================
+
+    private int forestSize(String parameters) {
+        return clampInt(getNumericParameter(parameters, "n_estimators", 5), 1, 20);
+    }
+
+    /** 一步训练一棵树：在当前森林上再加一棵，然后重新评估投票结果 */
+    private StepResult trainRandomForestStep(
+            Dataset dataset,
+            String parameters,
+            TrainingSimulationResponse.ModelData modelData) {
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        applyMatrixMetadata(modelData, data, "random_forest");
+        List<List<Integer>> votes = ensureVotes(data, modelData);
+        List<Double> importanceSums = ensureImportanceSums(data, modelData);
+        int trained = modelData.getTreeCount() == null ? 0 : modelData.getTreeCount();
+        int target = forestSize(parameters);
+        // 一步只训练一棵树
+        if (trained < target) {
+            trainOneForestTree(data, getDecisionTreeConfig(parameters), votes, importanceSums, trained);
+            modelData.setTreeCount(trained + 1);
+        }
+        return evaluateRandomForest(dataset, parameters, modelData);
+    }
+
+    /** 把森林补到 targetTrees 棵（一次性训练用）；已经训练过的树不会重训 */
+    private TrainingSimulationResponse.ModelData buildRandomForest(
+            Dataset dataset,
+            String parameters,
+            TrainingSimulationResponse.ModelData modelData,
+            int targetTrees) {
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        applyMatrixMetadata(modelData, data, "random_forest");
+        List<List<Integer>> votes = ensureVotes(data, modelData);
+        List<Double> importanceSums = ensureImportanceSums(data, modelData);
+        int trained = modelData.getTreeCount() == null ? 0 : modelData.getTreeCount();
+        DecisionTreeConfig config = getDecisionTreeConfig(parameters);
+        for (int index = trained; index < targetTrees; index++) {
+            trainOneForestTree(data, config, votes, importanceSums, index);
+            modelData.setTreeCount(index + 1);
+        }
+        return modelData;
+    }
+
+    /** 票数矩阵按数据行对齐；形状不对（旧会话/换数据集）就重建，并从第 0 棵树重新开始 */
+    private List<List<Integer>> ensureVotes(
+            DataMatrix data,
+            TrainingSimulationResponse.ModelData modelData) {
+        List<List<Integer>> votes = modelData.getVoteCounts();
+        if (votes == null || votes.size() != data.rows.size()) {
+            votes = emptyVotes(data);
+            modelData.setVoteCounts(votes);
+            modelData.setTreeCount(0);
+        }
+        return votes;
+    }
+
+    private List<Double> ensureImportanceSums(
+            DataMatrix data,
+            TrainingSimulationResponse.ModelData modelData) {
+        List<Double> sums = modelData.getImportanceSums();
+        if (sums == null || sums.size() != data.featureCount()) {
+            sums = zeroWeights(data.featureCount());
+            modelData.setImportanceSums(sums);
+            modelData.setTreeCount(0);
+        }
+        return sums;
+    }
+
+    private List<List<Integer>> emptyVotes(DataMatrix data) {
+        int classCount = Math.max(1, data.classNames.size());
+        List<List<Integer>> votes = new ArrayList<>(data.rows.size());
+        for (int i = 0; i < data.rows.size(); i++) {
+            List<Integer> row = new ArrayList<>(classCount);
+            for (int c = 0; c < classCount; c++) {
+                row.add(0);
+            }
+            votes.add(row);
+        }
+        return votes;
+    }
+
+    /**
+     * 训练一棵树：bootstrap 抽样 + 每个节点随机抽 sqrt(m) 个维度（随机森林的去相关手段），
+     * 然后让整棵树对全部样本投票，票数累加到 voteCounts，重要性累加到 importanceSums。
+     */
+    private void trainOneForestTree(
+            DataMatrix data,
+            DecisionTreeConfig config,
+            List<List<Integer>> votes,
+            List<Double> importanceSums,
+            int treeIndex) {
+        Random random = new Random(FOREST_SEED + treeIndex * 7919L);
+        List<DataRow> sample = bootstrapRows(data.rows, random);
+        if (sample.isEmpty()) {
+            return;
+        }
+        List<TrainingSimulationResponse.TreeNode> tree = buildDecisionTree(sample, data.featureNames, config, random);
+        for (int i = 0; i < data.rows.size(); i++) {
+            int predicted = predictWithTree(tree, data.rows.get(i));
+            List<Integer> row = votes.get(i);
+            if (predicted >= 0 && predicted < row.size()) {
+                row.set(predicted, row.get(predicted) + 1);
+            }
+        }
+        List<Double> treeImportance = treeImportance(tree, data.featureCount());
+        for (int j = 0; j < importanceSums.size() && j < treeImportance.size(); j++) {
+            importanceSums.set(j, importanceSums.get(j) + treeImportance.get(j));
+        }
+    }
+
+    private List<DataRow> bootstrapRows(List<DataRow> rows, Random random) {
+        List<DataRow> sample = new ArrayList<>(rows.size());
+        for (int i = 0; i < rows.size(); i++) {
+            sample.add(rows.get(random.nextInt(rows.size())));
+        }
+        return sample;
+    }
+
+    /** 每个节点随机抽 max(1, sqrt(维度数)) 个候选维度，这是随机森林和单纯 bagging 的区别所在 */
+    private List<Integer> randomFeatureSubset(int featureCount, Random random) {
+        int size = Math.max(1, (int) Math.round(Math.sqrt(Math.max(1, featureCount))));
+        List<Integer> indices = new ArrayList<>(featureCount);
+        for (int i = 0; i < featureCount; i++) {
+            indices.add(i);
+        }
+        Collections.shuffle(indices, random);
+        return new ArrayList<>(indices.subList(0, Math.min(size, featureCount)));
+    }
+
+    /** 用一棵完整的树预测单个样本 */
+    private int predictWithTree(List<TrainingSimulationResponse.TreeNode> tree, DataRow row) {
+        if (tree == null || tree.isEmpty()) {
+            return 0;
+        }
+        TrainingSimulationResponse.TreeNode node = tree.get(0);
+        int guard = 0;
+        while (guard++ < tree.size()) {
+            Integer featureIndex = node.getFeatureIndex();
+            if (featureIndex == null || node.getLeftId() == null || node.getRightId() == null) {
+                break;
+            }
+            boolean left = row.features()[featureIndex] <= node.getThreshold();
+            int nextId = left ? node.getLeftId() : node.getRightId();
+            if (nextId < 0 || nextId >= tree.size()) {
+                break;
+            }
+            node = tree.get(nextId);
+        }
+        return node.getClassIndex() == null ? 0 : node.getClassIndex();
+    }
+
+    /** 一棵树的重要性：各分裂节点按样本占比加权的不纯度下降，归一到 1 */
+    private List<Double> treeImportance(List<TrainingSimulationResponse.TreeNode> tree, int featureCount) {
+        double[] importance = new double[featureCount];
+        if (tree.isEmpty() || featureCount == 0) {
+            return toDoubleList(importance);
+        }
+        int totalSamples = tree.get(0).getSamples() == null ? 0 : tree.get(0).getSamples();
+        if (totalSamples <= 0) {
+            return toDoubleList(importance);
+        }
+        for (TrainingSimulationResponse.TreeNode node : tree) {
+            Integer featureIndex = node.getFeatureIndex();
+            if (featureIndex == null || featureIndex < 0 || featureIndex >= featureCount) {
+                continue;
+            }
+            if (node.getLeftId() == null || node.getRightId() == null) {
+                continue;
+            }
+            TrainingSimulationResponse.TreeNode left = tree.get(node.getLeftId());
+            TrainingSimulationResponse.TreeNode right = tree.get(node.getRightId());
+            int nodeSamples = node.getSamples() == null ? 0 : node.getSamples();
+            if (nodeSamples <= 0) {
+                continue;
+            }
+            double childImpurity = (
+                    (left.getSamples() == null ? 0 : left.getSamples())
+                            * (left.getImpurity() == null ? 0.0 : left.getImpurity())
+                    + (right.getSamples() == null ? 0 : right.getSamples())
+                            * (right.getImpurity() == null ? 0.0 : right.getImpurity())
+            ) / nodeSamples;
+            double decrease = Math.max(0.0,
+                    (node.getImpurity() == null ? 0.0 : node.getImpurity()) - childImpurity);
+            importance[featureIndex] += ((double) nodeSamples / totalSamples) * decrease;
+        }
+        double sum = 0.0;
+        for (double value : importance) {
+            sum += value;
+        }
+        if (sum > 0) {
+            for (int i = 0; i < importance.length; i++) {
+                importance[i] /= sum;
+            }
+        }
+        return toDoubleList(importance);
+    }
+
+    private List<Double> toDoubleList(double[] values) {
+        List<Double> list = new ArrayList<>(values.length);
+        for (double value : values) {
+            list.add(value);
+        }
+        return list;
+    }
+
+    private StepResult evaluateRandomForest(
+            Dataset dataset,
+            String parameters,
+            TrainingSimulationResponse.ModelData modelData) {
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        applyMatrixMetadata(modelData, data, "random_forest");
+        int treeCount = modelData.getTreeCount() == null ? 0 : modelData.getTreeCount();
+        List<List<Integer>> votes = modelData.getVoteCounts();
+        if (treeCount <= 0 || votes == null || votes.size() != data.rows.size()) {
+            // 还没有任何树：用多数类作为基线预测（与"0 次分裂的决策树"一致）
+            int majority = rowsMajorityClass(data.rows);
+            List<Integer> assignments = new ArrayList<>(data.rows.size());
+            int correct = 0;
+            for (DataRow row : data.rows) {
+                assignments.add(majority);
+                if (row.classIndex() == majority) {
+                    correct += 1;
+                }
+            }
+            modelData.setAssignments(assignments);
+            modelData.setFeatureImportances(List.of());
+            double baseline = (double) correct / Math.max(1, data.rows.size());
+            return new StepResult(modelData, round(1.0 - baseline), round(baseline), "Accuracy");
+        }
+
+        List<Integer> assignments = new ArrayList<>(data.rows.size());
+        int correct = 0;
+        for (int i = 0; i < data.rows.size(); i++) {
+            int predicted = argmax(votes.get(i));
+            assignments.add(predicted);
+            if (predicted == data.rows.get(i).classIndex()) {
+                correct += 1;
+            }
+        }
+        modelData.setAssignments(assignments);
+        modelData.setFeatureImportances(forestImportances(data, modelData));
+
+        double accuracy = (double) correct / Math.max(1, data.rows.size());
+        // 随机森林用"错误率"作为损失
+        return new StepResult(modelData, round(1.0 - accuracy), round(accuracy), "Accuracy");
+    }
+
+    private int argmax(List<Integer> counts) {
+        int best = 0;
+        int bestCount = -1;
+        for (int i = 0; i < counts.size(); i++) {
+            int count = counts.get(i) == null ? 0 : counts.get(i);
+            if (count > bestCount) {
+                bestCount = count;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private List<TrainingSimulationResponse.FeatureImportance> forestImportances(
+            DataMatrix data,
+            TrainingSimulationResponse.ModelData modelData) {
+        List<TrainingSimulationResponse.FeatureImportance> importances = new ArrayList<>();
+        List<Double> sums = modelData.getImportanceSums();
+        int treeCount = modelData.getTreeCount() == null ? 0 : modelData.getTreeCount();
+        if (sums == null || sums.size() != data.featureCount() || treeCount <= 0) {
+            return importances;
+        }
+        double total = 0.0;
+        for (double value : sums) {
+            total += value;
+        }
+        for (int j = 0; j < sums.size(); j++) {
+            TrainingSimulationResponse.FeatureImportance importance = new TrainingSimulationResponse.FeatureImportance();
+            importance.setFeature(data.featureNames.get(j));
+            importance.setImportance(round(total <= 0 ? 0.0 : sums.get(j) / total));
+            importances.add(importance);
+        }
+        importances.sort((left, right) -> Double.compare(right.getImportance(), left.getImportance()));
+        return importances;
     }
 
     private StepResult trainSvm(Dataset dataset, String parameters, TrainingSimulationResponse.ModelData modelData) {
@@ -2065,10 +2375,6 @@ public class TrainingSimulationService {
         return updated;
     }
 
-    private boolean isLeft(DataPoint2d point, String feature, double threshold) {
-        return ("x".equals(feature) ? point.x : point.y) <= threshold;
-    }
-
     private double nodeImpurity(Map<Integer, Integer> counts, int count, DecisionTreeConfig config) {
         if ("entropy".equals(config.criterion)) {
             return entropy(counts, count);
@@ -2436,6 +2742,10 @@ public class TrainingSimulationService {
             int maxDepth = clampInt(getNumericParameter(parameters, "maxDepth", 5), 1, 20);
             return maxDepth * 2;
         }
+        // 随机森林一步训练一棵树，总步数就是树的数量
+        if (algorithm != null && "random_forest".equals(algorithm.getName())) {
+            return forestSize(parameters);
+        }
         return DEFAULT_TOTAL_STEPS;
     }
 
@@ -2476,6 +2786,9 @@ public class TrainingSimulationService {
         }
         if ("decision_tree".equals(name)) {
             return "Gini";
+        }
+        if ("random_forest".equals(name)) {
+            return "Error";
         }
         return "Loss";
     }

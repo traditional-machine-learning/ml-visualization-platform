@@ -491,9 +491,10 @@ export class ExperimentComponent implements OnInit, OnDestroy {
   }
 
   private applyTrainingResponse(response: TrainingSimulationResponse): void {
-    // 决策树一步 = 一次分裂，总步数等于完整树的节点数，只有后端知道，必须用返回值；
+    // 决策树一步 = 一次分裂、随机森林一步 = 一棵树，总步数只有后端知道，必须用返回值；
     // 其余算法沿用参数推导出的步数
-    const totalSteps = this.selectedAlgorithm?.name === 'decision_tree' && response.totalSteps > 0
+    const name = this.selectedAlgorithm?.name;
+    const totalSteps = (name === 'decision_tree' || name === 'random_forest') && response.totalSteps > 0
       ? response.totalSteps
       : this.getTotalSteps();
     this.trainingState = {
