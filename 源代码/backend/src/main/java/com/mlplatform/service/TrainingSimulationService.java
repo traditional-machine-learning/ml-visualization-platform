@@ -724,6 +724,7 @@ public class TrainingSimulationService {
         modelData.setModelKind(modelKind);
         modelData.setFeatureNames(new ArrayList<>(data.featureNames));
         modelData.setTargetName(data.targetName);
+        modelData.setClassNames(new ArrayList<>(data.classNames));
     }
 
     private List<Double> zeroWeights(int size) {
@@ -998,14 +999,18 @@ public class TrainingSimulationService {
 
         int correct = 0;
         double impuritySum = 0.0;
+        // 当前（已展开的）树对每个样本的预测类别，画布据此实时着色，和聚类的 assignments 同一套约定
+        List<Integer> assignments = new ArrayList<>(data.rows.size());
         for (DataRow row : data.rows) {
             TrainingSimulationResponse.TreeNode terminal = terminalNode(nodes, revealed, row);
-            Integer predicted = terminal.getClassIndex();
-            if (predicted != null && predicted == row.classIndex()) {
+            Integer predicted = terminal.getClassIndex() == null ? 0 : terminal.getClassIndex();
+            assignments.add(predicted);
+            if (predicted == row.classIndex()) {
                 correct += 1;
             }
             impuritySum += terminal.getImpurity() == null ? 0.0 : terminal.getImpurity();
         }
+        modelData.setAssignments(assignments);
         int n = Math.max(1, data.rows.size());
         double accuracy = data.rows.isEmpty() ? 0.0 : (double) correct / data.rows.size();
         // 损失取"叶节点不纯度的样本平均"，也就是当前这棵树真正达到的不纯度
@@ -1590,6 +1595,7 @@ public class TrainingSimulationService {
         private final double targetMean;
         private final double targetScale;
         private final String targetName;
+        private final List<String> classNames;
 
         private DataMatrix(
                 List<String> featureNames,
@@ -1600,7 +1606,8 @@ public class TrainingSimulationService {
                 double[] maxs,
                 double targetMean,
                 double targetScale,
-                String targetName) {
+                String targetName,
+                List<String> classNames) {
             this.featureNames = featureNames;
             this.rows = rows;
             this.means = means;
@@ -1610,6 +1617,7 @@ public class TrainingSimulationService {
             this.targetMean = targetMean;
             this.targetScale = targetScale;
             this.targetName = targetName;
+            this.classNames = classNames;
         }
 
         private int featureCount() {
@@ -1751,7 +1759,30 @@ public class TrainingSimulationService {
             rows.add(new DataRow(values[i], targetValues[i], classValues[i], classIndexes[i]));
         }
         return new DataMatrix(
-                featureNames, rows, means, scales, mins, maxs, targetMean, targetScale, targetName);
+                featureNames, rows, means, scales, mins, maxs, targetMean, targetScale, targetName,
+                buildClassNames(classIndexes, labelMap));
+    }
+
+    /** 类别编号 → 原始标签名；数值型标签（没有进 labelMap）就用数字本身兜底 */
+    private List<String> buildClassNames(int[] classIndexes, Map<String, Integer> labelMap) {
+        int maxIndex = -1;
+        for (int classIndex : classIndexes) {
+            maxIndex = Math.max(maxIndex, classIndex);
+        }
+        if (maxIndex < 0) {
+            return List.of();
+        }
+        String[] names = new String[maxIndex + 1];
+        for (int i = 0; i <= maxIndex; i++) {
+            names[i] = String.valueOf(i);
+        }
+        for (Map.Entry<String, Integer> entry : labelMap.entrySet()) {
+            int index = entry.getValue() == null ? -1 : entry.getValue();
+            if (index >= 0 && index < names.length) {
+                names[index] = entry.getKey();
+            }
+        }
+        return new ArrayList<>(Arrays.asList(names));
     }
 
     /** 声明为数值、且数据里至少一半能解析成数字的列才算特征；纯文本列（如某些标签）不参与训练 */

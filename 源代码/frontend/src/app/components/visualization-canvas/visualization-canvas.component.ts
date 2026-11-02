@@ -262,7 +262,13 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   }
 
   getLegendColor(label: string): string {
-    return this.getColorMap()[label] || '#378ADD';
+    const map = this.getColorMap();
+    if (map[label]) {
+      return map[label];
+    }
+    // "预测 setosa" 这类图例沿用类别本身的颜色
+    const base = label.replace(/^预测\s*/, '');
+    return map[base] || '#378ADD';
   }
 
   private renderChart(): void {
@@ -433,6 +439,10 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   private resolvePointLabel(label?: string, clusterId?: number, index?: number): string {
     const assignment = this.resolveAssignment(index);
     if (assignment !== undefined) {
+      // 决策树：按当前（已展开的）树给出的预测类别着色，实时反映分类结果
+      if (this.isDecisionTree) {
+        return this.predictionLabel(assignment);
+      }
       return `聚类 ${assignment + 1}`;
     }
     if (label) {
@@ -444,6 +454,16 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     return 'Samples';
   }
 
+  private get isDecisionTree(): boolean {
+    return this.trainingState?.modelData?.modelKind === 'decision_tree';
+  }
+
+  private predictionLabel(classIndex: number): string {
+    const names = this.trainingState?.modelData?.classNames;
+    const name = names && names.length > classIndex ? names[classIndex] : null;
+    return name ? `预测 ${name}` : `预测类别 ${classIndex + 1}`;
+  }
+
   private resolveAssignment(index?: number): number | undefined {
     const assignments = this.activeAssignments;
     if (index === undefined || !assignments || assignments.length !== this.dataset?.dataPoints?.length) {
@@ -453,7 +473,7 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   }
 
   /**
-   * 簇编号由后端在全维度空间里算出、按数据行下标对齐，因此换任何坐标轴都成立，
+   * 簇编号 / 预测类别由后端算出、按数据行下标对齐，因此换任何坐标轴都成立，
    * 不再像以前那样只在训练用的两维上才敢用来着色。
    */
   private get activeAssignments(): number[] | undefined {

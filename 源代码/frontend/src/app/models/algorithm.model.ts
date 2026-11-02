@@ -85,6 +85,8 @@ export interface TrainingModelData {
   modelKind?: string;
   featureNames?: string[];
   targetName?: string;
+  /** 类别编号 → 原始标签名，用于按预测类别着色时的图例 */
+  classNames?: string[];
 }
 
 /** 模型在用户所选两个维度上的投影，由后端 /visualization/projection 计算 */

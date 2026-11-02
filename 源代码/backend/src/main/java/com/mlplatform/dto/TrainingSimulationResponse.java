@@ -77,6 +77,8 @@ public class TrainingSimulationResponse {
         private String modelKind;
         private List<String> featureNames;
         private String targetName;
+        /** 类别编号 → 原始标签名（如 0/1/2 → setosa/versicolor/virginica），用于按预测类别着色时的图例 */
+        private List<String> classNames;
         /** 贪心决策树的完整节点表（按 BFS 顺序编号）；revealedSplits 之前的分裂才是"当前已展开"的部分 */
         private List<TreeNode> tree;
         private Integer revealedSplits;
@@ -104,6 +106,8 @@ public class TrainingSimulationResponse {
         public void setFeatureNames(List<String> featureNames) { this.featureNames = featureNames; }
         public String getTargetName() { return targetName; }
         public void setTargetName(String targetName) { this.targetName = targetName; }
+        public List<String> getClassNames() { return classNames; }
+        public void setClassNames(List<String> classNames) { this.classNames = classNames; }
         public List<TreeNode> getTree() { return tree; }
         public void setTree(List<TreeNode> tree) { this.tree = tree; }
         public Integer getRevealedSplits() { return revealedSplits; }
