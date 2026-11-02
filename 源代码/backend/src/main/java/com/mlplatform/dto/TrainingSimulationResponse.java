@@ -77,6 +77,9 @@ public class TrainingSimulationResponse {
         private String modelKind;
         private List<String> featureNames;
         private String targetName;
+        /** 贪心决策树的完整节点表（按 BFS 顺序编号）；revealedSplits 之前的分裂才是"当前已展开"的部分 */
+        private List<TreeNode> tree;
+        private Integer revealedSplits;
         private List<Integer> assignments;
         private String splitFeature;
         private Double splitThreshold;
@@ -101,6 +104,10 @@ public class TrainingSimulationResponse {
         public void setFeatureNames(List<String> featureNames) { this.featureNames = featureNames; }
         public String getTargetName() { return targetName; }
         public void setTargetName(String targetName) { this.targetName = targetName; }
+        public List<TreeNode> getTree() { return tree; }
+        public void setTree(List<TreeNode> tree) { this.tree = tree; }
+        public Integer getRevealedSplits() { return revealedSplits; }
+        public void setRevealedSplits(Integer revealedSplits) { this.revealedSplits = revealedSplits; }
         public List<Integer> getAssignments() { return assignments; }
         public void setAssignments(List<Integer> assignments) { this.assignments = assignments; }
         public String getSplitFeature() { return splitFeature; }
@@ -142,5 +149,47 @@ public class TrainingSimulationResponse {
         public void setFeature(String feature) { this.feature = feature; }
         public Double getImportance() { return importance; }
         public void setImportance(Double importance) { this.importance = importance; }
+    }
+
+    /**
+     * 贪心决策树的一个节点。
+     * <p>
+     * 整棵树在一次构建里算完，但只有 splitOrder 小于 revealedSplits 的节点才真正"展开"；
+     * 其余节点按叶子处理（用 classIndex 预测），因此每次训练步只要把 revealedSplits 加一，
+     * 模型就恰好停在"最近一次分裂"的状态上。
+     */
+    public static class TreeNode {
+        private Integer id;
+        private Integer depth;
+        /** null 表示这是叶子 */
+        private String feature;
+        private Double threshold;
+        /** 该节点自身的不纯度（展开成叶子时也用它作为这部分数据的损失） */
+        private Double impurity;
+        /** 该节点的多数类；节点尚未展开时就以它作为预测 */
+        private Integer classIndex;
+        private Integer leftId;
+        private Integer rightId;
+        /** 第几个被展开（BFS 顺序）；-1 表示这棵树里它永远不会分裂 */
+        private Integer splitOrder;
+
+        public Integer getId() { return id; }
+        public void setId(Integer id) { this.id = id; }
+        public Integer getDepth() { return depth; }
+        public void setDepth(Integer depth) { this.depth = depth; }
+        public String getFeature() { return feature; }
+        public void setFeature(String feature) { this.feature = feature; }
+        public Double getThreshold() { return threshold; }
+        public void setThreshold(Double threshold) { this.threshold = threshold; }
+        public Double getImpurity() { return impurity; }
+        public void setImpurity(Double impurity) { this.impurity = impurity; }
+        public Integer getClassIndex() { return classIndex; }
+        public void setClassIndex(Integer classIndex) { this.classIndex = classIndex; }
+        public Integer getLeftId() { return leftId; }
+        public void setLeftId(Integer leftId) { this.leftId = leftId; }
+        public Integer getRightId() { return rightId; }
+        public void setRightId(Integer rightId) { this.rightId = rightId; }
+        public Integer getSplitOrder() { return splitOrder; }
+        public void setSplitOrder(Integer splitOrder) { this.splitOrder = splitOrder; }
     }
 }

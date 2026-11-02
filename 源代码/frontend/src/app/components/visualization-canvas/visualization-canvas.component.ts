@@ -544,12 +544,13 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
       return centroids.length ? [this.buildCentroidSeries(centroids)] : [];
     }
 
-    const line = projection.line;
-    if (!this.isLineData(line)) {
+    const lines = (projection.lines ?? []).filter((line) => this.isLineData(line));
+    if (!lines.length) {
       return [];
     }
     const isRegression = projection.kind === 'regression_line';
-    return [{
+    // 决策树会给出多条分区线段，一条线段一个 series
+    return lines.map((line) => ({
       name: isRegression ? '回归线' : '决策边界',
       type: 'line',
       data: line,
@@ -558,7 +559,7 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
         ? { color: 'rgba(0, 0, 0, 0.65)', width: 1.5 }
         : { color: 'rgba(0, 0, 0, 0.55)', width: 1.5, type: 'dashed' },
       z: 10
-    }];
+    }));
   }
 
   private buildCentroidSeries(centroids: number[][]): any {

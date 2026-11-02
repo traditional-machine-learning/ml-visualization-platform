@@ -21,8 +21,8 @@ public class ProjectionDTO {
     private String xName;
     private String yName;
     private String kind;
-    /** 回归线 / 决策边界的折线点（原始单位坐标） */
-    private List<List<Double>> line;
+    /** 回归线 / 决策边界的折线（原始单位坐标）；决策树会返回多条轴对齐的分区线段 */
+    private List<List<List<Double>>> lines;
     /** 聚类中心在所选两维上的投影 */
     private List<TrainingSimulationResponse.Centroid> centroids;
     /** 每个样本的簇编号，按数据行下标对齐（全维度聚类结果，任意坐标轴都成立） */
@@ -38,8 +38,8 @@ public class ProjectionDTO {
     public void setYName(String yName) { this.yName = yName; }
     public String getKind() { return kind; }
     public void setKind(String kind) { this.kind = kind; }
-    public List<List<Double>> getLine() { return line; }
-    public void setLine(List<List<Double>> line) { this.line = line; }
+    public List<List<List<Double>>> getLines() { return lines; }
+    public void setLines(List<List<List<Double>>> lines) { this.lines = lines; }
     public List<TrainingSimulationResponse.Centroid> getCentroids() { return centroids; }
     public void setCentroids(List<TrainingSimulationResponse.Centroid> centroids) { this.centroids = centroids; }
     public List<Integer> getAssignments() { return assignments; }

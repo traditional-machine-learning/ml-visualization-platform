@@ -94,8 +94,8 @@ export interface TrainingProjection {
   yName: string;
   /** regression_line / decision_boundary / centroids / none */
   kind: string;
-  /** 回归线或决策边界的折线点 */
-  line?: number[][];
+  /** 回归线 / 决策边界的折线；决策树会给出多条轴对齐的分区线段 */
+  lines?: number[][][];
   centroids?: TrainingCentroid[];
   assignments?: number[];
   /** 画布上要显示的说明文案 */
