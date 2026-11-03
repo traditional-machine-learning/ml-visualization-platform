@@ -1,6 +1,14 @@
 <mat-card class="param-panel-card">
   <mat-card-header>
     <mat-card-title>超参数面板</mat-card-title>
+    <button
+      mat-button
+      type="button"
+      class="reset-defaults-button"
+      [disabled]="!algorithm"
+      (click)="onResetDefaults()">
+      恢复默认值
+    </button>
   </mat-card-header>
   <mat-card-content>
     <div *ngIf="algorithm" class="param-list">
