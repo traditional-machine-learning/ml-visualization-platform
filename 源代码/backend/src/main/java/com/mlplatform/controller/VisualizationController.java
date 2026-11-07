@@ -2,6 +2,7 @@ package com.mlplatform.controller;
 
 import com.mlplatform.dto.ApiResponse;
 import com.mlplatform.dto.DatasetDTO;
+import com.mlplatform.dto.ProjectionDTO;
 import com.mlplatform.dto.TrainingSimulationResponse;
 import com.mlplatform.service.DatasetService;
 import com.mlplatform.service.TrainingSimulationService;
@@ -30,6 +31,18 @@ public class VisualizationController {
     @GetMapping("/decision-boundary/{sessionId}")
     public ApiResponse<TrainingSimulationResponse.ModelData> getDecisionBoundary(@PathVariable Long sessionId) {
         return ApiResponse.success(trainingSimulationService.getModelData(sessionId));
+    }
+
+    /**
+     * 把模型投影到用户所选的两个维度上。
+     * 线性回归 / 逻辑回归 / K-Means 会按全维度模型重新求平面切片；
+     * 决策树 / SVM / 随机森林只有在两维等于训练维度时才回放结果，否则 kind = "none"。
+     */
+    @GetMapping("/projection/{sessionId}")
+    public ApiResponse<ProjectionDTO> getProjection(@PathVariable Long sessionId,
+                                                    @RequestParam String xName,
+                                                    @RequestParam String yName) {
+        return ApiResponse.success(trainingSimulationService.projectModel(sessionId, xName, yName));
     }
 
     // Reserved for Team Member 3 - Model explanation

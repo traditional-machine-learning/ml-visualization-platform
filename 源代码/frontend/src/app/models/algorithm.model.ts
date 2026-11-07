@@ -69,6 +69,8 @@ export interface TrainingCentroid {
   x: number;
   y: number;
   clusterId: number;
+  /** 全维度质心坐标（按 modelData.featureNames 顺序） */
+  values?: number[];
 }
 
 export interface TrainingModelData {
@@ -79,6 +81,27 @@ export interface TrainingModelData {
   pcaComponents?: number[][];
   pcaTransformed?: number[][];
   featureImportances?: FeatureImportance[];
+  /** 全维度模型自述：算法种类 / 训练所用维度 / 监督目标维度 */
+  modelKind?: string;
+  featureNames?: string[];
+  targetName?: string;
+  /** 类别编号 → 原始标签名，用于按预测类别着色时的图例 */
+  classNames?: string[];
+}
+
+/** 模型在用户所选两个维度上的投影，由后端 /visualization/projection 计算 */
+export interface TrainingProjection {
+  sessionId?: number;
+  xName: string;
+  yName: string;
+  /** regression_line / decision_boundary / centroids / none */
+  kind: string;
+  /** 回归线 / 决策边界的折线；决策树会给出多条轴对齐的分区线段 */
+  lines?: number[][][];
+  centroids?: TrainingCentroid[];
+  assignments?: number[];
+  /** 画布上要显示的说明文案 */
+  note?: string;
 }
 
 export interface FeatureImportance {

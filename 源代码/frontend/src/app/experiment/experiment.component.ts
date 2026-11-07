@@ -507,14 +507,18 @@ export class ExperimentComponent implements OnInit, OnDestroy {
   }
 
   private applyTrainingResponse(response: TrainingSimulationResponse): void {
-    // Keep the totalSteps from parameters, only use API response if it matches
-    const totalSteps = this.getTotalSteps();
+    // 决策树一步 = 一次分裂、随机森林一步 = 一棵树，总步数只有后端知道，必须用返回值；
+    // 其余算法沿用参数推导出的步数
+    const name = this.selectedAlgorithm?.name;
+    const totalSteps = (name === 'decision_tree' || name === 'random_forest') && response.totalSteps > 0
+      ? response.totalSteps
+      : this.getTotalSteps();
     this.trainingState = {
       ...this.trainingState,
       sessionId: response.sessionId,
       status: this.normalizeStatus(response.status),
       currentStep: response.currentStep,
-      totalSteps: totalSteps, // Use parameter-based totalSteps instead of API default
+      totalSteps: totalSteps,
       loss: response.loss,
       accuracy: response.accuracy,
       scoreLabel: response.scoreLabel,

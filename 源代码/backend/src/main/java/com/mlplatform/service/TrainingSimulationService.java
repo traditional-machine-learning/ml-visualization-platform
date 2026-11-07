@@ -2,6 +2,7 @@ package com.mlplatform.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mlplatform.dto.ProjectionDTO;
 import com.mlplatform.dto.TrainingSimulationResponse;
 import com.mlplatform.model.Algorithm;
 import com.mlplatform.model.Dataset;
@@ -11,17 +12,23 @@ import com.mlplatform.repository.DatasetRepository;
 import com.mlplatform.repository.TrainingSessionRepository;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 
 @Service
 public class TrainingSimulationService {
     private static final int DEFAULT_TOTAL_STEPS = 100;
     private static final double EPSILON = 1.0e-9;
+    /** 随机森林的固定随机种子：同样的数据与参数下结果可复现 */
+    private static final long FOREST_SEED = 20_240_517L;
 
     private final AlgorithmRepository algorithmRepository;
     private final DatasetRepository datasetRepository;
@@ -53,6 +60,11 @@ public class TrainingSimulationService {
         session.setTotalSteps(totalSteps);
 
         TrainingSimulationResponse.ModelData initialModel = initializeModelData(algorithm, dataset, session.getParameters());
+        if ("decision_tree".equals(algorithm.getName())) {
+            // 决策树一步 = 一次分裂，总步数等于完整贪心树的内部节点数；只有建完树才知道，这里回填
+            totalSteps = Math.max(1, countSplits(initialModel.getTree()));
+            session.setTotalSteps(totalSteps);
+        }
         TrainingSimulationResponse initial = buildResponse(session, algorithm, dataset, initialModel, null);
         session.setMetrics(toJson(initial.getMetrics()));
         session.setModelData(toJson(initial.getModelData()));
@@ -137,6 +149,270 @@ public class TrainingSimulationService {
         return buildMetrics(algorithm, session.getCurrentStep(), session.getTotalSteps(), current);
     }
 
+    /**
+     * 把当前 session 的模型投影到用户所选的两个维度上。
+     * <p>
+     * 线性回归 / 逻辑回归 / K-Means 是真正的全维度模型，这里按平面切片重新求几何；
+     * 决策树 / SVM / 随机森林仍按两维训练，只有在请求的两维等于训练维度时才回放过往结果。
+     */
+    public ProjectionDTO projectModel(Long sessionId, String xName, String yName) {
+        TrainingSession session = requireSession(sessionId);
+        Algorithm algorithm = requireAlgorithm(session.getAlgorithmId());
+        Dataset dataset = requireDataset(session.getDatasetId());
+        TrainingSimulationResponse.ModelData modelData = readOrInitializeModelData(session, algorithm, dataset);
+        return project(algorithm, dataset, modelData, sessionId, xName, yName);
+    }
+
+    private ProjectionDTO project(
+            Algorithm algorithm,
+            Dataset dataset,
+            TrainingSimulationResponse.ModelData modelData,
+            Long sessionId,
+            String xName,
+            String yName) {
+        ProjectionDTO projection = new ProjectionDTO();
+        projection.setSessionId(sessionId);
+        projection.setXName(xName);
+        projection.setYName(yName);
+        String name = algorithm.getName() == null ? "" : algorithm.getName();
+        String type = algorithm.getType() == null ? "" : algorithm.getType();
+
+        // 决策树仍是两维训练，但在训练维度上可以画出完整的分区线（每个已展开节点的分裂线）
+        if ("decision_tree".equals(name)) {
+            return projectDecisionTree(dataset, modelData, projection, xName, yName);
+        }
+        // 随机森林由多棵树投票，分区无法直接投影，只按预测类别着色
+        if ("random_forest".equals(name)) {
+            return projectRandomForest(projection);
+        }
+        // 与训练侧用同一个判定，保证"全维训练"和"能投影"永远一致
+        if (!isFullDimensionAlgorithm(name, type)) {
+            return projectLegacy(dataset, modelData, projection, name, xName, yName);
+        }
+        if ("kmeans".equals(name) || "clustering".equals(type)) {
+            return projectCentroids(dataset, modelData, projection, xName, yName);
+        }
+        if ("linear_regression".equals(name) || "regression".equals(type)) {
+            return projectRegression(dataset, modelData, projection, xName, yName);
+        }
+        return projectLinearBoundary(dataset, modelData, projection, xName, yName);
+    }
+
+    /** 回归：只有当目标维度出现在坐标轴上时才能画线，否则只给提示 */
+    private ProjectionDTO projectRegression(
+            Dataset dataset,
+            TrainingSimulationResponse.ModelData modelData,
+            ProjectionDTO projection,
+            String xName,
+            String yName) {
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        String targetName = data.targetName;
+        boolean targetOnX = targetName != null && targetName.equals(xName);
+        boolean targetOnY = targetName != null && targetName.equals(yName);
+
+        if (!targetOnX && !targetOnY) {
+            String targetLabel = targetName == null ? "目标列" : targetName;
+            return noProjection(
+                    projection,
+                    "目标维度 " + targetLabel + " 不在当前坐标轴上，无法投影回归线；"
+                            + "请把 " + targetLabel + " 设为其中一条轴。");
+        }
+
+        String featureName = targetOnX ? yName : xName;
+        int featureIndex = data.featureIndex(featureName);
+        if (featureIndex < 0) {
+            return noProjection(projection, "所选维度的取值无法用于回归投影。");
+        }
+        List<List<Double>> line = buildFullRegressionLine(
+                data, modelData.getWeights(), modelData.getBias() == null ? 0.0 : modelData.getBias(), featureIndex);
+        if (line == null) {
+            return noProjection(projection, "当前模型还没有可投影的回归结果。");
+        }
+        projection.setKind(ProjectionDTO.KIND_REGRESSION_LINE);
+        projection.setLines(List.of(targetOnX ? swapAxes(line) : line));
+        projection.setNote(projectionNote(data, modelData, featureName, targetOnY ? yName : xName));
+        return projection;
+    }
+
+    /** 线性分类：隐藏维固定在均值后仍是一条直线 */
+    private ProjectionDTO projectLinearBoundary(
+            Dataset dataset,
+            TrainingSimulationResponse.ModelData modelData,
+            ProjectionDTO projection,
+            String xName,
+            String yName) {
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        int xIndex = data.featureIndex(xName);
+        int yIndex = data.featureIndex(yName);
+        if (xIndex < 0 || yIndex < 0) {
+            return noProjection(projection, "决策边界只能投影到两个特征维度上。");
+        }
+        List<List<Double>> line = buildFullLinearBoundary(
+                data,
+                xIndex,
+                yIndex,
+                modelData.getWeights(),
+                modelData.getBias() == null ? 0.0 : modelData.getBias());
+        if (line == null) {
+            return noProjection(projection, "当前权重在这两个维度上无法确定边界（系数接近 0）。");
+        }
+        projection.setKind(ProjectionDTO.KIND_DECISION_BOUNDARY);
+        projection.setLines(List.of(line));
+        projection.setNote(projectionNote(data, modelData, xName, yName));
+        return projection;
+    }
+
+    /** 聚类：质心直接取那两个维度的坐标；簇编号是全维聚类结果，换轴依然成立 */
+    private ProjectionDTO projectCentroids(
+            Dataset dataset,
+            TrainingSimulationResponse.ModelData modelData,
+            ProjectionDTO projection,
+            String xName,
+            String yName) {
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.NONE);
+        int xIndex = data.featureIndex(xName);
+        int yIndex = data.featureIndex(yName);
+        if (xIndex < 0 || yIndex < 0) {
+            return noProjection(projection, "聚类中心只能投影到两个特征维度上。");
+        }
+        List<TrainingSimulationResponse.Centroid> centroids = new ArrayList<>();
+        if (modelData.getCentroids() != null) {
+            for (TrainingSimulationResponse.Centroid centroid : modelData.getCentroids()) {
+                List<Double> values = centroid.getValues();
+                if (values == null || values.size() < data.featureCount()) {
+                    continue;
+                }
+                TrainingSimulationResponse.Centroid projected = new TrainingSimulationResponse.Centroid();
+                projected.setClusterId(centroid.getClusterId());
+                projected.setX(round(values.get(xIndex)));
+                projected.setY(round(values.get(yIndex)));
+                projected.setValues(values);
+                centroids.add(projected);
+            }
+        }
+        projection.setKind(ProjectionDTO.KIND_CENTROIDS);
+        projection.setCentroids(centroids);
+        projection.setAssignments(modelData.getAssignments());
+        projection.setNote("K-Means 在 " + data.featureCount() + " 维空间中聚类，"
+                + "这里只取质心在当前两维上的坐标；点的颜色仍是全维聚类结果。");
+        return projection;
+    }
+
+    /** 随机森林：多棵树的决策分区没有二维闭式表示，因此不画分区线，只靠样本的预测类别着色 */
+    private ProjectionDTO projectRandomForest(ProjectionDTO projection) {
+        projection.setKind(ProjectionDTO.KIND_NONE);
+        projection.setLines(null);
+        projection.setCentroids(null);
+        projection.setAssignments(null);
+        projection.setNote("随机森林的预测结果按样本着色显示；多棵树的决策分区无法直接投影到二维平面，"
+                + "因此不绘制分区线，想看单个模型的分区可以切换到决策树。");
+        return projection;
+    }
+
+    /** 决策树：仍是两维训练，但在训练维度上可以画出完整的分区线（每个已展开节点的分裂线） */
+    private ProjectionDTO projectDecisionTree(
+            Dataset dataset,
+            TrainingSimulationResponse.ModelData modelData,
+            ProjectionDTO projection,
+            String xName,
+            String yName) {
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        int xIndex = data.featureIndex(xName);
+        int yIndex = data.featureIndex(yName);
+        if (xIndex < 0 || yIndex < 0 || xIndex == yIndex) {
+            return noProjection(projection, "决策树的分区只能投影到两个特征维度上。");
+        }
+
+        List<TrainingSimulationResponse.TreeNode> nodes = modelData.getTree();
+        int splitCount = countSplits(nodes);
+        int revealed = modelData.getRevealedSplits() == null ? 0 : modelData.getRevealedSplits();
+        if (nodes == null || nodes.isEmpty() || revealed <= 0) {
+            return noProjection(projection,
+                    "决策树还没有完成第一次分裂（已展开 0 / " + splitCount + " 个节点）。");
+        }
+
+        List<List<List<Double>>> segments = new ArrayList<>();
+        collectTreeSegments(nodes, 0, revealed, xIndex, yIndex, data.means,
+                data.mins[xIndex], data.maxs[xIndex], data.mins[yIndex], data.maxs[yIndex], segments);
+        if (segments.isEmpty()) {
+            return noProjection(projection,
+                    "该平面没有切到已展开的分裂（其余维度取均值后预测恒定），所以画不出分区线。");
+        }
+        int hidden = Math.max(0, data.featureCount() - 2);
+        projection.setKind(ProjectionDTO.KIND_DECISION_BOUNDARY);
+        projection.setLines(segments);
+        projection.setNote("全维度贪心决策树（" + data.featureCount() + " 维特征）在 "
+                + xName + " / " + yName + " 平面上的投影：其余 " + hidden + " 个维度固定在各自的均值；"
+                + "已展开 " + revealed + " / " + splitCount + " 个节点，一次单步只分裂一个节点。");
+        return projection;
+    }
+
+    /** 决策树 / SVM / 随机森林：本轮仍是两维训练，只有在训练维度上才有几何结果 */
+    private ProjectionDTO projectLegacy(
+            Dataset dataset,
+            TrainingSimulationResponse.ModelData modelData,
+            ProjectionDTO projection,
+            String name,
+            String xName,
+            String yName) {
+        List<String> axes = trainingAxes(dataset);
+        String trainedX = axes.get(0);
+        String trainedY = axes.get(1);
+        String trainingLabel = trainedX + " / " + trainedY;
+        String note = "该算法当前仍只在 " + trainingLabel + " 这两个维度上训练，"
+                + "切换到其他坐标轴无法显示结果。";
+
+        if (trainedX == null || trainedY == null) {
+            return noProjection(projection, "数据集缺少可用于训练的维度。");
+        }
+        if (!trainedX.equals(xName) || !trainedY.equals(yName)) {
+            return noProjection(projection, note);
+        }
+        if ("svm".equals(name)) {
+            List<List<Double>> boundary = modelData.getDecisionBoundary();
+            List<List<Double>> regressionLine = modelData.getRegressionLine();
+            List<List<Double>> line = boundary != null && boundary.size() >= 2 ? boundary : regressionLine;
+            if (line == null || line.size() < 2) {
+                return noProjection(projection, note);
+            }
+            projection.setKind(boundary != null && boundary.size() >= 2
+                    ? ProjectionDTO.KIND_DECISION_BOUNDARY
+                    : ProjectionDTO.KIND_REGRESSION_LINE);
+            projection.setLines(List.of(line));
+            projection.setNote(note);
+            return projection;
+        }
+        return noProjection(projection, "该算法暂不提供平面投影结果。");
+    }
+
+    private ProjectionDTO noProjection(ProjectionDTO projection, String note) {
+        projection.setKind(ProjectionDTO.KIND_NONE);
+        projection.setLines(null);
+        projection.setCentroids(null);
+        projection.setAssignments(null);
+        projection.setNote(note);
+        return projection;
+    }
+
+    private List<List<Double>> swapAxes(List<List<Double>> line) {
+        List<List<Double>> swapped = new ArrayList<>(line.size());
+        for (List<Double> point : line) {
+            swapped.add(Arrays.asList(point.get(1), point.get(0)));
+        }
+        return swapped;
+    }
+
+    private String projectionNote(
+            DataMatrix data,
+            TrainingSimulationResponse.ModelData modelData,
+            String xName,
+            String yName) {
+        int hidden = Math.max(0, data.featureCount() - 2);
+        String model = "logistic_regression".equals(modelData.getModelKind()) ? "逻辑回归" : "回归";
+        return "全维度" + model + "（" + data.featureCount() + " 维特征）在 "
+                + xName + " / " + yName + " 平面上的投影：其余 " + hidden + " 个维度固定在各自的均值。";
+    }
+
     // ----- Advanced features: PCA and Random Forest (simulated) -----
     public TrainingSimulationResponse startPca(Long algorithmId, Long datasetId, String parameters) {
         Algorithm algorithm = requireAlgorithm(algorithmId);
@@ -187,78 +463,50 @@ public class TrainingSimulationService {
         return response;
     }
 
+    /**
+     * 一次性训练完整森林（对比页 / 兼容旧调用）。
+     * 正式训练走会话流程：一步训练一棵树，见 {@link #trainRandomForestStep}。
+     */
     public TrainingSimulationResponse startRandomForest(Long algorithmId, Long datasetId, String parameters) {
         Algorithm algorithm = requireAlgorithm(algorithmId);
         Dataset dataset = requireDataset(datasetId);
-        int nEstimators = clampInt(getNumericParameter(parameters, "n_estimators", 5), 1, 20);
-
-        DataSet2d data = loadDataSet(dataset, algorithm);
-        List<DecisionSplit> trees = new ArrayList<>();
-        List<String> featureUsed = new ArrayList<>();
-        for (int t = 0; t < nEstimators; t++) {
-            // bootstrap sample indices
-            List<DataPoint2d> sample = new ArrayList<>();
-            for (int i = 0; i < data.points.size(); i++) {
-                int idx = (int) Math.floor(Math.random() * data.points.size());
-                sample.add(data.points.get(idx));
-            }
-            DecisionSplit split = findBestDecisionSplit(sample, getDecisionTreeConfig(parameters));
-            trees.add(split);
-            featureUsed.add(split.feature);
-        }
-
-        // aggregate predictions
-        int correct = 0;
-        for (DataPoint2d point : data.points) {
-            Map<Integer, Integer> votes = new HashMap<>();
-            for (DecisionSplit split : trees) {
-                int pred = isLeft(point, split.feature, split.threshold) ? split.leftClassIndex : split.rightClassIndex;
-                votes.merge(pred, 1, Integer::sum);
-            }
-            int finalPred = votes.entrySet().stream().max((a, b) -> Integer.compare(a.getValue(), b.getValue())).map(Map.Entry::getKey).orElse(0);
-            if (finalPred == point.classIndex) correct += 1;
-        }
-        double accuracy = data.points.isEmpty() ? 0.0 : (double) correct / data.points.size();
-
-        // feature importances (frequency)
-        Map<String, Integer> freq = new HashMap<>();
-        for (String f : featureUsed) freq.merge(f, 1, Integer::sum);
-        List<TrainingSimulationResponse.FeatureImportance> importances = new ArrayList<>();
-        int total = trees.size() == 0 ? 1 : trees.size();
-        for (String f : List.of("x", "y")) {
-            double imp = freq.getOrDefault(f, 0) / (double) total;
-            TrainingSimulationResponse.FeatureImportance fi = new TrainingSimulationResponse.FeatureImportance();
-            fi.setFeature(f);
-            fi.setImportance(round(imp));
-            importances.add(fi);
-        }
+        String normalizedParams = normalizeParameters(parameters);
 
         TrainingSimulationResponse.ModelData modelData = new TrainingSimulationResponse.ModelData();
-        modelData.setFeatureImportances(importances);
+        int treeCount = forestSize(normalizedParams);
+        buildRandomForest(dataset, normalizedParams, modelData, treeCount);
+        StepResult result = evaluateRandomForest(dataset, normalizedParams, modelData);
 
         TrainingSimulationResponse response = new TrainingSimulationResponse();
         response.setAlgorithmId(algorithmId);
         response.setDatasetId(datasetId);
         response.setStatus("completed");
-        response.setCurrentStep(0);
-        response.setTotalSteps(0);
-        response.setLoss(0.0);
-        response.setAccuracy(round(accuracy));
-        response.setScoreLabel("Accuracy");
-        response.setModelData(modelData);
+        response.setCurrentStep(treeCount);
+        response.setTotalSteps(treeCount);
+        response.setLoss(round(result.loss));
+        response.setAccuracy(round(result.score));
+        response.setScoreLabel(result.scoreLabel);
+        response.setModelData(result.modelData);
         return response;
     }
 
     public TrainingSimulationResponse simulateFeatureSelection(Long algorithmId, Long datasetId, List<String> selectedFeatures, String parameters) {
         Algorithm algorithm = requireAlgorithm(algorithmId);
         Dataset dataset = requireDataset(datasetId);
-        // build filtered dataset
+        String labelName = parseFeatures(dataset.getFeatures()).stream()
+                .filter(feature -> "label".equals(feature.type))
+                .map(feature -> feature.name)
+                .findFirst()
+                .orElse(null);
+        // build filtered dataset：标签列必须一起保留，否则回归/分类找不到目标列
         List<LinkedHashMap<String, Object>> rows = parseRows(dataset.getDataContent());
         List<LinkedHashMap<String, Object>> filtered = new ArrayList<>();
         for (LinkedHashMap<String, Object> row : rows) {
             LinkedHashMap<String, Object> nr = new LinkedHashMap<>();
             for (String key : row.keySet()) {
-                if (selectedFeatures.contains(key) || "label".equals(key)) {
+                if (selectedFeatures.contains(key)
+                        || "label".equals(key)
+                        || (labelName != null && labelName.equals(key))) {
                     nr.put(key, row.get(key));
                 }
             }
@@ -267,7 +515,7 @@ public class TrainingSimulationService {
         Dataset tmp = new Dataset();
         tmp.setId(dataset.getId());
         tmp.setName(dataset.getName());
-        tmp.setFeatures(buildFeaturesJson(selectedFeatures, dataset));
+        tmp.setFeatures(buildFeaturesJson(selectedFeatures, dataset, labelName));
         try {
             tmp.setDataContent(objectMapper.writeValueAsString(filtered));
         } catch (Exception e) {
@@ -276,6 +524,14 @@ public class TrainingSimulationService {
 
         // Evaluate using existing evaluation logic
         TrainingSimulationResponse.ModelData modelData = initializeModelData(algorithm, tmp, "{}");
+        if ("decision_tree".equals(algorithm.getName()) && modelData.getTree() != null) {
+            // 这个面板是一次性评估，直接展示整棵树的结果（单步训练语义只影响正式训练）
+            modelData.setRevealedSplits(countSplits(modelData.getTree()));
+        }
+        if ("random_forest".equals(algorithm.getName())) {
+            // 同理：一次性把森林训练完再评估
+            buildRandomForest(tmp, "{}", modelData, forestSize("{}"));
+        }
         StepResult result = evaluateCurrentState(algorithm, tmp, parameters, modelData);
 
         TrainingSimulationResponse response = new TrainingSimulationResponse();
@@ -352,26 +608,20 @@ public class TrainingSimulationService {
 
     private TrainingSimulationResponse.ModelData initializeModelData(Algorithm algorithm, Dataset dataset, String parameters) {
         TrainingSimulationResponse.ModelData modelData = new TrainingSimulationResponse.ModelData();
-        DataSet2d data = loadDataSet(dataset, algorithm);
-        DataStats stats = new DataStats(data.points);
         String name = algorithm.getName() == null ? "" : algorithm.getName();
         String type = algorithm.getType() == null ? "" : algorithm.getType();
 
-        if ("linear_regression".equals(name)) {
-            modelData.setWeights(List.of(0.0));
-            modelData.setBias(0.0);
-            modelData.setRegressionLine(buildRegressionLine(stats, 0.0, 0.0));
-        } else if ("logistic_regression".equals(name) || "svm".equals(name)) {
+        if (isFullDimensionAlgorithm(name, type)) {
+            return initializeFullDimensionModel(modelData, name, type, dataset, parameters);
+        }
+
+        DataSet2d data = loadDataSet(dataset, null);
+        DataStats stats = new DataStats(data.points);
+
+        if ("svm".equals(name)) {
             modelData.setWeights(Arrays.asList(0.0, 0.0));
             modelData.setBias(0.0);
             modelData.setDecisionBoundary(buildLinearBoundary(stats, List.of(0.0, 0.0), 0.0));
-        } else if ("kmeans".equals(name) || "clustering".equals(type)) {
-            List<TrainingSimulationResponse.Centroid> centroids = initializeCentroids(data.points, getK(parameters));
-            modelData.setCentroids(centroids);
-            modelData.setAssignments(assignClusters(data.points, centroids));
-        } else if ("decision_tree".equals(name)) {
-            DecisionSplit split = findBestDecisionSplit(data.points, getDecisionTreeConfig(parameters));
-            applyDecisionSplitModel(modelData, stats, split);
         } else if ("classification".equals(type)) {
             modelData.setWeights(Arrays.asList(0.0, 0.0));
             modelData.setBias(0.0);
@@ -385,12 +635,112 @@ public class TrainingSimulationService {
         return modelData;
     }
 
+    /**
+     * 已完成全维度改造的算法：线性回归、逻辑回归、K-Means、决策树。
+     * SVM 与随机森林仍按 {@link #loadDataSet} 选出的两维训练，等后续单独升级。
+     */
+    private boolean isFullDimensionAlgorithm(String name, String type) {
+        if ("svm".equals(name)) {
+            return false;
+        }
+        return "linear_regression".equals(name)
+                || "logistic_regression".equals(name)
+                || "kmeans".equals(name)
+                || "decision_tree".equals(name)
+                || "random_forest".equals(name)
+                || "regression".equals(type)
+                || "classification".equals(type)
+                || "clustering".equals(type);
+    }
+
+    private TrainingSimulationResponse.ModelData initializeFullDimensionModel(
+            TrainingSimulationResponse.ModelData modelData,
+            String name,
+            String type,
+            Dataset dataset,
+            String parameters) {
+        if ("decision_tree".equals(name)) {
+            DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+            applyMatrixMetadata(modelData, data, "decision_tree");
+            // 初始化时一棵树都还没展开（0 次分裂），第一次单步才会分出根节点
+            List<TrainingSimulationResponse.TreeNode> nodes =
+                    buildDecisionTree(data.rows, data.featureNames, getDecisionTreeConfig(parameters));
+            applyTreeState(modelData, nodes, 0);
+            return modelData;
+        }
+        if ("random_forest".equals(name)) {
+            DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+            applyMatrixMetadata(modelData, data, "random_forest");
+            // 初始化时一棵树都还没有，第一次单步才会训练第一棵
+            modelData.setTreeCount(0);
+            modelData.setVoteCounts(emptyVotes(data));
+            modelData.setImportanceSums(zeroWeights(data.featureCount()));
+            return modelData;
+        }
+        if ("kmeans".equals(name) || "clustering".equals(type)) {
+            DataMatrix data = loadDataMatrix(dataset, TargetMode.NONE);
+            applyMatrixMetadata(modelData, data, "kmeans");
+            List<TrainingSimulationResponse.Centroid> centroids = initializeCentroids(data, getK(parameters));
+            modelData.setCentroids(centroids);
+            modelData.setAssignments(assignClusters(data, centroids));
+            return modelData;
+        }
+
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        boolean regression = "linear_regression".equals(name) || "regression".equals(type);
+        applyMatrixMetadata(modelData, data, regression ? "linear_regression" : "logistic_regression");
+        modelData.setWeights(zeroWeights(data.featureCount()));
+        modelData.setBias(0.0);
+
+        if (regression) {
+            modelData.setRegressionLine(defaultRegressionLine(data, dataset, modelData.getWeights(), 0.0));
+        } else {
+            modelData.setDecisionBoundary(defaultBoundary(data, dataset, modelData.getWeights(), 0.0));
+        }
+
+        return modelData;
+    }
+
+    /** 全维度算法的模型自述：训练用了哪些维度、目标维度是谁 */
+    private void applyMatrixMetadata(
+            TrainingSimulationResponse.ModelData modelData,
+            DataMatrix data,
+            String modelKind) {
+        modelData.setModelKind(modelKind);
+        modelData.setFeatureNames(new ArrayList<>(data.featureNames));
+        modelData.setTargetName(data.targetName);
+        modelData.setClassNames(new ArrayList<>(data.classNames));
+    }
+
+    private List<Double> zeroWeights(int size) {
+        List<Double> weights = new ArrayList<>(Math.max(0, size));
+        for (int index = 0; index < size; index++) {
+            weights.add(0.0);
+        }
+        return weights;
+    }
+
     private TrainingSimulationResponse.ModelData readOrInitializeModelData(
             TrainingSession session,
             Algorithm algorithm,
             Dataset dataset) {
         if (session.getModelData() != null && !session.getModelData().isBlank()) {
-            return fromJson(session.getModelData(), TrainingSimulationResponse.ModelData.class);
+            TrainingSimulationResponse.ModelData modelData =
+                    fromJson(session.getModelData(), TrainingSimulationResponse.ModelData.class);
+            // 旧格式会话（没有树结构，或还是两维训练的树）无法继续按"每次分裂"推进，按当前参数重建
+            if ("decision_tree".equals(algorithm.getName())
+                    && (!"decision_tree".equals(modelData.getModelKind())
+                        || modelData.getTree() == null
+                        || modelData.getTree().isEmpty())) {
+                return initializeModelData(algorithm, dataset, session.getParameters());
+            }
+            // 随机森林同理：旧会话里没有投票状态，重建
+            if ("random_forest".equals(algorithm.getName())
+                    && (!"random_forest".equals(modelData.getModelKind())
+                        || modelData.getVoteCounts() == null)) {
+                return initializeModelData(algorithm, dataset, session.getParameters());
+            }
+            return modelData;
         }
         return initializeModelData(algorithm, dataset, session.getParameters());
     }
@@ -414,6 +764,9 @@ public class TrainingSimulationService {
         }
         if ("decision_tree".equals(name)) {
             return trainDecisionTree(dataset, parameters, modelData);
+        }
+        if ("random_forest".equals(name)) {
+            return trainRandomForestStep(dataset, parameters, modelData);
         }
         if ("svm".equals(name)) {
             return trainSvm(dataset, parameters, modelData);
@@ -444,6 +797,9 @@ public class TrainingSimulationService {
         if ("decision_tree".equals(name)) {
             return evaluateDecisionTree(dataset, parameters, modelData);
         }
+        if ("random_forest".equals(name)) {
+            return evaluateRandomForest(dataset, parameters, modelData);
+        }
         if ("svm".equals(name)) {
             return evaluateSvm(dataset, parameters, modelData);
         }
@@ -451,114 +807,110 @@ public class TrainingSimulationService {
     }
 
     private StepResult trainLinearRegression(Dataset dataset, String parameters, TrainingSimulationResponse.ModelData modelData) {
-        DataSet2d data = loadDataSet(dataset, null);
-        DataStats stats = new DataStats(data.points);
-        double w = getWeight(modelData, 0);
-        double b = modelData.getBias() == null ? 0.0 : modelData.getBias();
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        applyMatrixMetadata(modelData, data, "linear_regression");
+        int featureCount = data.featureCount();
+        double[] weights = weightsArray(modelData, featureCount);
+        double bias = modelData.getBias() == null ? 0.0 : modelData.getBias();
         double learningRate = clamp(getNumericParameter(parameters, "learningRate", 0.03), 0.0001, 0.2);
         double momentum = 0.35;
 
-        double dw = 0.0;
-        double db = 0.0;
-        for (DataPoint2d point : data.points) {
-            double x = stats.normalizeX(point.x);
-            double y = stats.normalizeTarget(point.target);
-            double prediction = w * x + b;
-            double error = prediction - y;
-            dw += 2.0 * error * x;
-            db += 2.0 * error;
+        double[] gradient = new double[featureCount];
+        double gradientBias = 0.0;
+        for (DataRow row : data.rows) {
+            double prediction = dotNormalized(data, weights, row) + bias;
+            double error = prediction - data.normalizeTarget(row.target);
+            for (int index = 0; index < featureCount; index++) {
+                gradient[index] += 2.0 * error * data.normalizeFeature(index, row.features[index]);
+            }
+            gradientBias += 2.0 * error;
         }
-        int n = Math.max(1, data.points.size());
-        double targetW = w - learningRate * dw / n;
-        double targetB = b - learningRate * db / n;
-        w = w + (targetW - w) * momentum;
-        b = b + (targetB - b) * momentum;
+        int n = Math.max(1, data.rows.size());
+        for (int index = 0; index < featureCount; index++) {
+            double targetWeight = weights[index] - learningRate * gradient[index] / n;
+            weights[index] = weights[index] + (targetWeight - weights[index]) * momentum;
+        }
+        double targetBias = bias - learningRate * gradientBias / n;
+        bias = bias + (targetBias - bias) * momentum;
 
-        modelData.setWeights(List.of(round(w)));
-        modelData.setBias(round(b));
-        modelData.setRegressionLine(buildRegressionLine(stats, w, b));
+        modelData.setWeights(roundWeights(weights));
+        modelData.setBias(round(bias));
+        modelData.setRegressionLine(
+                defaultRegressionLine(data, dataset, modelData.getWeights(), modelData.getBias()));
         return evaluateLinearRegression(dataset, modelData);
     }
 
     private StepResult evaluateLinearRegression(Dataset dataset, TrainingSimulationResponse.ModelData modelData) {
-        DataSet2d data = loadDataSet(dataset, null);
-        DataStats stats = new DataStats(data.points);
-        double w = getWeight(modelData, 0);
-        double b = modelData.getBias() == null ? 0.0 : modelData.getBias();
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        applyMatrixMetadata(modelData, data, "linear_regression");
+        double[] weights = weightsArray(modelData, data.featureCount());
+        double bias = modelData.getBias() == null ? 0.0 : modelData.getBias();
         double loss = 0.0;
         double sse = 0.0;
         double sst = 0.0;
 
-        for (DataPoint2d point : data.points) {
-            double x = stats.normalizeX(point.x);
-            double y = stats.normalizeTarget(point.target);
-            double prediction = w * x + b;
-            double error = prediction - y;
+        for (DataRow row : data.rows) {
+            double prediction = dotNormalized(data, weights, row) + bias;
+            double error = prediction - data.normalizeTarget(row.target);
             loss += error * error;
-            double rawPrediction = stats.denormalizeTarget(prediction);
-            double rawError = rawPrediction - point.target;
+            double rawPrediction = data.denormalizeTarget(prediction);
+            double rawError = rawPrediction - row.target;
             sse += rawError * rawError;
-            double targetCenter = point.target - stats.avgTarget;
+            double targetCenter = row.target - data.targetMean;
             sst += targetCenter * targetCenter;
         }
 
-        int n = Math.max(1, data.points.size());
+        int n = Math.max(1, data.rows.size());
         double mse = loss / n;
         double r2 = sst < EPSILON ? 1.0 : 1.0 - sse / sst;
-        modelData.setRegressionLine(buildRegressionLine(stats, w, b));
+        modelData.setRegressionLine(defaultRegressionLine(data, dataset, modelData.getWeights(), bias));
         return new StepResult(modelData, round(mse), round(clamp(r2, 0.0, 0.99)), "R2");
     }
 
     private StepResult trainLogisticRegression(Dataset dataset, String parameters, TrainingSimulationResponse.ModelData modelData) {
-        DataSet2d data = loadDataSet(dataset, null);
-        DataStats stats = new DataStats(data.points);
-        double w1 = getWeight(modelData, 0);
-        double w2 = getWeight(modelData, 1);
-        double b = modelData.getBias() == null ? 0.0 : modelData.getBias();
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        applyMatrixMetadata(modelData, data, "logistic_regression");
+        int featureCount = data.featureCount();
+        double[] weights = weightsArray(modelData, featureCount);
+        double bias = modelData.getBias() == null ? 0.0 : modelData.getBias();
         double learningRate = clamp(getNumericParameter(parameters, "learningRate", 0.08), 0.0001, 0.8);
         double momentum = 0.35;
 
-        double dw1 = 0.0;
-        double dw2 = 0.0;
-        double db = 0.0;
-        for (DataPoint2d point : data.points) {
-            double x = stats.normalizeX(point.x);
-            double y = stats.normalizeY(point.y);
-            double target = point.classValue;
-            double probability = sigmoid(w1 * x + w2 * y + b);
-            double error = probability - target;
-            dw1 += error * x;
-            dw2 += error * y;
-            db += error;
+        double[] gradient = new double[featureCount];
+        double gradientBias = 0.0;
+        for (DataRow row : data.rows) {
+            double probability = sigmoid(dotNormalized(data, weights, row) + bias);
+            double error = probability - row.classValue;
+            for (int index = 0; index < featureCount; index++) {
+                gradient[index] += error * data.normalizeFeature(index, row.features[index]);
+            }
+            gradientBias += error;
         }
-        int n = Math.max(1, data.points.size());
-        double targetW1 = w1 - learningRate * dw1 / n;
-        double targetW2 = w2 - learningRate * dw2 / n;
-        double targetB = b - learningRate * db / n;
-        w1 = w1 + (targetW1 - w1) * momentum;
-        w2 = w2 + (targetW2 - w2) * momentum;
-        b = b + (targetB - b) * momentum;
+        int n = Math.max(1, data.rows.size());
+        for (int index = 0; index < featureCount; index++) {
+            double targetWeight = weights[index] - learningRate * gradient[index] / n;
+            weights[index] = weights[index] + (targetWeight - weights[index]) * momentum;
+        }
+        double targetBias = bias - learningRate * gradientBias / n;
+        bias = bias + (targetBias - bias) * momentum;
 
-        modelData.setWeights(Arrays.asList(round(w1), round(w2)));
-        modelData.setBias(round(b));
-        modelData.setDecisionBoundary(buildLinearBoundary(stats, List.of(w1, w2), b));
+        modelData.setWeights(roundWeights(weights));
+        modelData.setBias(round(bias));
+        modelData.setDecisionBoundary(defaultBoundary(data, dataset, modelData.getWeights(), modelData.getBias()));
         return evaluateLogisticRegression(dataset, modelData);
     }
 
     private StepResult evaluateLogisticRegression(Dataset dataset, TrainingSimulationResponse.ModelData modelData) {
-        DataSet2d data = loadDataSet(dataset, null);
-        DataStats stats = new DataStats(data.points);
-        double w1 = getWeight(modelData, 0);
-        double w2 = getWeight(modelData, 1);
-        double b = modelData.getBias() == null ? 0.0 : modelData.getBias();
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        applyMatrixMetadata(modelData, data, "logistic_regression");
+        double[] weights = weightsArray(modelData, data.featureCount());
+        double bias = modelData.getBias() == null ? 0.0 : modelData.getBias();
         double loss = 0.0;
         int correct = 0;
 
-        for (DataPoint2d point : data.points) {
-            double x = stats.normalizeX(point.x);
-            double y = stats.normalizeY(point.y);
-            double target = point.classValue;
-            double probability = clamp(sigmoid(w1 * x + w2 * y + b), EPSILON, 1.0 - EPSILON);
+        for (DataRow row : data.rows) {
+            double target = row.classValue;
+            double probability = clamp(sigmoid(dotNormalized(data, weights, row) + bias), EPSILON, 1.0 - EPSILON);
             loss += -(target * Math.log(probability) + (1.0 - target) * Math.log(1.0 - probability));
             int predicted = probability >= 0.5 ? 1 : 0;
             if (predicted == (int) target) {
@@ -566,83 +918,686 @@ public class TrainingSimulationService {
             }
         }
 
-        modelData.setDecisionBoundary(buildLinearBoundary(stats, List.of(w1, w2), b));
-        double accuracy = data.points.isEmpty() ? 0.0 : (double) correct / data.points.size();
-        return new StepResult(modelData, round(loss / Math.max(1, data.points.size())), round(accuracy), "Accuracy");
+        modelData.setDecisionBoundary(defaultBoundary(data, dataset, modelData.getWeights(), bias));
+        double accuracy = data.rows.isEmpty() ? 0.0 : (double) correct / data.rows.size();
+        return new StepResult(modelData, round(loss / Math.max(1, data.rows.size())), round(accuracy), "Accuracy");
     }
 
     private StepResult trainKMeans(Dataset dataset, String parameters, TrainingSimulationResponse.ModelData modelData) {
-        DataSet2d data = loadDataSet(dataset, null);
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.NONE);
+        applyMatrixMetadata(modelData, data, "kmeans");
         int k = getK(parameters);
         List<TrainingSimulationResponse.Centroid> centroids = modelData.getCentroids();
-        if (centroids == null || centroids.size() != k) {
-            centroids = initializeCentroids(data.points, k);
+        if (!isUsableCentroids(centroids, k, data.featureCount())) {
+            centroids = initializeCentroids(data, k);
         }
 
-        List<Integer> assignments = assignClusters(data.points, centroids);
-        List<TrainingSimulationResponse.Centroid> updated = recomputeCentroids(data.points, assignments, centroids);
+        List<Integer> assignments = assignClusters(data, centroids);
+        List<TrainingSimulationResponse.Centroid> updated = recomputeCentroids(data, assignments, centroids);
         modelData.setCentroids(updated);
-        modelData.setAssignments(assignClusters(data.points, updated));
+        modelData.setAssignments(assignClusters(data, updated));
         return evaluateKMeans(dataset, modelData);
     }
 
     private StepResult evaluateKMeans(Dataset dataset, TrainingSimulationResponse.ModelData modelData) {
-        DataSet2d data = loadDataSet(dataset, null);
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.NONE);
+        applyMatrixMetadata(modelData, data, "kmeans");
         List<TrainingSimulationResponse.Centroid> centroids = modelData.getCentroids();
-        if (centroids == null || centroids.isEmpty()) {
-            centroids = initializeCentroids(data.points, 3);
+        if (!isUsableCentroids(centroids, centroids == null ? 0 : centroids.size(), data.featureCount())) {
+            centroids = initializeCentroids(data, 3);
             modelData.setCentroids(centroids);
         }
-        List<Integer> assignments = assignClusters(data.points, centroids);
+        List<Integer> assignments = assignClusters(data, centroids);
         modelData.setAssignments(assignments);
 
         double inertia = 0.0;
-        for (int i = 0; i < data.points.size(); i++) {
-            DataPoint2d point = data.points.get(i);
-            TrainingSimulationResponse.Centroid centroid = centroids.get(assignments.get(i));
-            inertia += squaredDistance(point.x, point.y, centroid.getX(), centroid.getY());
+        for (int index = 0; index < data.rows.size(); index++) {
+            TrainingSimulationResponse.Centroid centroid = centroids.get(assignments.get(index));
+            inertia += normalizedSquaredDistance(data, data.rows.get(index), centroid);
         }
 
-        double normalizedInertia = normalizeInertia(inertia, data.points);
-        double silhouette = approximateSilhouette(data.points, assignments, centroids);
+        double normalizedInertia = normalizeInertia(inertia, data.rows.size(), data.featureCount());
+        double silhouette = approximateSilhouette(data, assignments, centroids);
         return new StepResult(modelData, round(normalizedInertia), round(silhouette), "Silhouette");
     }
 
+    /**
+     * 决策树的一步训练 = 展开一个节点（一次分裂）。
+     * 完整的贪心树在第一次需要时构建一次并存在 modelData 里，
+     * 之后每一步只把 revealedSplits 加一，因此暂停时模型恰好停在最近一次分裂的状态。
+     */
     private StepResult trainDecisionTree(Dataset dataset, String parameters, TrainingSimulationResponse.ModelData modelData) {
-        DataSet2d data = loadDataSet(dataset, null);
-        DataStats stats = new DataStats(data.points);
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
         DecisionTreeConfig config = getDecisionTreeConfig(parameters);
-        DecisionSplit split = findBestDecisionSplit(data.points, config);
-        applyDecisionSplitModel(modelData, stats, split);
+        List<TrainingSimulationResponse.TreeNode> nodes = modelData.getTree();
+        if (nodes == null || nodes.isEmpty()) {
+            nodes = buildDecisionTree(data.rows, data.featureNames, config);
+            modelData.setTree(nodes);
+            modelData.setRevealedSplits(0);
+        }
+        int splitCount = countSplits(nodes);
+        int revealed = modelData.getRevealedSplits() == null ? 0 : modelData.getRevealedSplits();
+        if (revealed < splitCount) {
+            revealed += 1; // 一次分裂
+        }
+        applyTreeState(modelData, nodes, revealed);
         return evaluateDecisionTree(dataset, parameters, modelData);
     }
 
     private StepResult evaluateDecisionTree(Dataset dataset, String parameters, TrainingSimulationResponse.ModelData modelData) {
-        DataSet2d data = loadDataSet(dataset, null);
-        DataStats stats = new DataStats(data.points);
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
         DecisionTreeConfig config = getDecisionTreeConfig(parameters);
-        DecisionSplit split = modelData.getSplitThreshold() == null
-                ? findBestDecisionSplit(data.points, config)
-                : buildDecisionSplit(data.points, modelData.getSplitFeature(), modelData.getSplitThreshold(), config);
-        if (modelData.getSplitThreshold() != null && modelData.getSplitImpurity() != null) {
-            split = new DecisionSplit(
-                    split.feature,
-                    split.threshold,
-                    modelData.getSplitImpurity(),
-                    split.leftClassIndex,
-                    split.rightClassIndex);
+        List<TrainingSimulationResponse.TreeNode> nodes = modelData.getTree();
+        if (nodes == null || nodes.isEmpty()) {
+            nodes = buildDecisionTree(data.rows, data.featureNames, config);
+            applyTreeState(modelData, nodes, 0);
         }
-        applyDecisionSplitModel(modelData, stats, split);
+        int revealed = modelData.getRevealedSplits() == null ? 0 : modelData.getRevealedSplits();
 
         int correct = 0;
-        for (DataPoint2d point : data.points) {
-            int prediction = predictDecisionSplit(point, split);
-            if (prediction == point.classIndex) {
+        double impuritySum = 0.0;
+        // 当前（已展开的）树对每个样本的预测类别，画布据此实时着色，和聚类的 assignments 同一套约定
+        List<Integer> assignments = new ArrayList<>(data.rows.size());
+        for (DataRow row : data.rows) {
+            TrainingSimulationResponse.TreeNode terminal = terminalNode(nodes, revealed, row);
+            Integer predicted = terminal.getClassIndex() == null ? 0 : terminal.getClassIndex();
+            assignments.add(predicted);
+            if (predicted == row.classIndex()) {
+                correct += 1;
+            }
+            impuritySum += terminal.getImpurity() == null ? 0.0 : terminal.getImpurity();
+        }
+        modelData.setAssignments(assignments);
+        int n = Math.max(1, data.rows.size());
+        double accuracy = data.rows.isEmpty() ? 0.0 : (double) correct / data.rows.size();
+        // 损失取"叶节点不纯度的样本平均"，也就是当前这棵树真正达到的不纯度
+        return new StepResult(modelData, round(impuritySum / n), round(accuracy), "Accuracy");
+    }
+
+    // ==================== 贪心决策树 ====================
+
+    private record PendingNode(int id, List<DataRow> rows) {}
+
+    /**
+     * 贪心建树：每个节点只做一次"当前最优的单次分裂"，然后对左右子集递归。
+     * <p>
+     * 在所有数值维度上搜索分裂；节点按 BFS 顺序编号与展开，
+     * 所以 revealedSplits 逐个累加时，树是"一层层长"的。
+     * 代价 O(节点数 · 特征数 · 取值数 · 样本数)，与原先的前瞻搜索相比低了几个数量级。
+     */
+    private List<TrainingSimulationResponse.TreeNode> buildDecisionTree(
+            List<DataRow> rows,
+            List<String> featureNames,
+            DecisionTreeConfig config) {
+        return buildDecisionTree(rows, featureNames, config, null);
+    }
+
+    /**
+     * @param random 为 null 时每个节点用全部维度（普通决策树）；
+     *               非 null 时每个节点随机抽 sqrt(m) 个维度（随机森林）
+     */
+    private List<TrainingSimulationResponse.TreeNode> buildDecisionTree(
+            List<DataRow> rows,
+            List<String> featureNames,
+            DecisionTreeConfig config,
+            Random random) {
+        List<TrainingSimulationResponse.TreeNode> nodes = new ArrayList<>();
+        nodes.add(createTreeNode(0, 0, rows, config));
+
+        Deque<PendingNode> queue = new ArrayDeque<>();
+        queue.add(new PendingNode(0, rows));
+        int nextId = 1;
+        int splitOrder = 0;
+
+        while (!queue.isEmpty()) {
+            PendingNode pending = queue.poll();
+            TrainingSimulationResponse.TreeNode node = nodes.get(pending.id());
+            if (node.getDepth() >= config.maxDepth
+                    || pending.rows().size() < config.minSamplesSplit) {
+                continue;
+            }
+            List<Integer> candidates = random == null
+                    ? null
+                    : randomFeatureSubset(featureNames.size(), random);
+            DecisionSplit split = findGreedySplit(pending.rows(), featureNames, config, candidates);
+            if (split == null) {
+                continue; // 没有能降低不纯度的分裂，保持叶子
+            }
+            node.setFeature(split.feature());
+            node.setFeatureIndex(split.featureIndex());
+            node.setThreshold(round(split.threshold()));
+            node.setSplitOrder(splitOrder++);
+
+            List<DataRow> left = new ArrayList<>();
+            List<DataRow> right = new ArrayList<>();
+            int featureIndex = split.featureIndex();
+            for (DataRow row : pending.rows()) {
+                if (row.features()[featureIndex] <= split.threshold()) {
+                    left.add(row);
+                } else {
+                    right.add(row);
+                }
+            }
+            int leftId = nextId++;
+            int rightId = nextId++;
+            nodes.add(createTreeNode(leftId, node.getDepth() + 1, left, config));
+            nodes.add(createTreeNode(rightId, node.getDepth() + 1, right, config));
+            node.setLeftId(leftId);
+            node.setRightId(rightId);
+            queue.add(new PendingNode(leftId, left));
+            queue.add(new PendingNode(rightId, right));
+        }
+        return nodes;
+    }
+
+    private TrainingSimulationResponse.TreeNode createTreeNode(
+            int id,
+            int depth,
+            List<DataRow> rows,
+            DecisionTreeConfig config) {
+        TrainingSimulationResponse.TreeNode node = new TrainingSimulationResponse.TreeNode();
+        node.setId(id);
+        node.setDepth(depth);
+        node.setSamples(rows.size());
+        node.setImpurity(round(rowsImpurity(rows, config)));
+        node.setClassIndex(rowsMajorityClass(rows));
+        node.setSplitOrder(-1);
+        return node;
+    }
+
+    /** 单个节点的贪心分裂：逐维度、逐阈值算加权不纯度，取最小者；没有改善就不分裂 */
+    private DecisionSplit findGreedySplit(
+            List<DataRow> rows,
+            List<String> featureNames,
+            DecisionTreeConfig config) {
+        return findGreedySplit(rows, featureNames, config, null);
+    }
+
+    private DecisionSplit findGreedySplit(
+            List<DataRow> rows,
+            List<String> featureNames,
+            DecisionTreeConfig config,
+            List<Integer> candidateFeatures) {
+        if (rows.size() < config.minSamplesSplit) {
+            return null;
+        }
+        double parentImpurity = rowsImpurity(rows, config);
+        DecisionSplit best = null;
+        int candidateCount = candidateFeatures == null ? featureNames.size() : candidateFeatures.size();
+        for (int position = 0; position < candidateCount; position++) {
+            int featureIndex = candidateFeatures == null ? position : candidateFeatures.get(position);
+            if (featureIndex < 0 || featureIndex >= featureNames.size()) {
+                continue;
+            }
+            final int index = featureIndex;
+            List<Double> values = rows.stream()
+                    .map(row -> row.features()[index])
+                    .distinct()
+                    .sorted()
+                    .toList();
+            for (int i = 0; i < values.size() - 1; i++) {
+                double threshold = (values.get(i) + values.get(i + 1)) / 2.0;
+                DecisionSplit candidate = buildDecisionSplit(
+                        rows, featureNames.get(index), index, threshold, config);
+                if (candidate == null) {
+                    continue;
+                }
+                if (best == null || candidate.impurity() < best.impurity()) {
+                    best = candidate;
+                }
+            }
+        }
+        if (best == null || best.impurity() >= parentImpurity - EPSILON) {
+            return null;
+        }
+        return best;
+    }
+
+    private DecisionSplit buildDecisionSplit(
+            List<DataRow> rows,
+            String feature,
+            int featureIndex,
+            double threshold,
+            DecisionTreeConfig config) {
+        Map<Integer, Integer> leftCounts = new HashMap<>();
+        Map<Integer, Integer> rightCounts = new HashMap<>();
+        int leftCount = 0;
+        int rightCount = 0;
+        for (DataRow row : rows) {
+            if (row.features()[featureIndex] <= threshold) {
+                leftCount += 1;
+                leftCounts.merge(row.classIndex(), 1, Integer::sum);
+            } else {
+                rightCount += 1;
+                rightCounts.merge(row.classIndex(), 1, Integer::sum);
+            }
+        }
+        if (leftCount == 0 || rightCount == 0) {
+            return null; // 阈值落在数据范围外，不是有效分裂
+        }
+        double impurity = ((double) leftCount / rows.size()) * nodeImpurity(leftCounts, leftCount, config)
+                + ((double) rightCount / rows.size()) * nodeImpurity(rightCounts, rightCount, config);
+        return new DecisionSplit(
+                feature,
+                featureIndex,
+                threshold,
+                impurity,
+                majorityClass(leftCounts),
+                majorityClass(rightCounts));
+    }
+
+    private int countSplits(List<TrainingSimulationResponse.TreeNode> nodes) {
+        if (nodes == null) {
+            return 0;
+        }
+        int count = 0;
+        for (TrainingSimulationResponse.TreeNode node : nodes) {
+            if (node.getSplitOrder() != null && node.getSplitOrder() >= 0) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /** 沿已展开的节点向下走，返回该样本最终落入的叶节点（未展开的节点本身就当叶子用） */
+    private TrainingSimulationResponse.TreeNode terminalNode(
+            List<TrainingSimulationResponse.TreeNode> nodes,
+            int revealed,
+            DataRow row) {
+        TrainingSimulationResponse.TreeNode node = nodes.get(0);
+        int guard = 0;
+        while (guard++ < nodes.size()) {
+            Integer featureIndex = node.getFeatureIndex();
+            Integer splitOrder = node.getSplitOrder();
+            if (featureIndex == null
+                    || node.getLeftId() == null
+                    || node.getRightId() == null
+                    || splitOrder == null
+                    || splitOrder < 0
+                    || splitOrder >= revealed) {
+                return node;
+            }
+            boolean left = row.features()[featureIndex] <= node.getThreshold();
+            node = nodes.get(left ? node.getLeftId() : node.getRightId());
+        }
+        return node;
+    }
+
+    private void applyTreeState(
+            TrainingSimulationResponse.ModelData modelData,
+            List<TrainingSimulationResponse.TreeNode> nodes,
+            int revealed) {
+        int safeRevealed = Math.max(0, Math.min(revealed, countSplits(nodes)));
+        modelData.setTree(nodes);
+        modelData.setRevealedSplits(safeRevealed);
+        TrainingSimulationResponse.TreeNode root = nodes.get(0);
+        if (safeRevealed > 0 && root.getFeature() != null) {
+            modelData.setSplitFeature(root.getFeature());
+            modelData.setSplitThreshold(root.getThreshold());
+            modelData.setSplitImpurity(root.getImpurity());
+        } else {
+            modelData.setSplitFeature(null);
+            modelData.setSplitThreshold(null);
+            modelData.setSplitImpurity(null);
+        }
+        // 树的分区可能由多条线段组成，统一由投影接口给出
+        modelData.setDecisionBoundary(null);
+    }
+
+    /**
+     * 把已展开节点的分裂线收集成轴对齐线段，得到树在 (xIndex, yIndex) 平面上的切片。
+     * 隐藏维度固定在其均值：遇到隐藏维度的分裂时按"均值 vs 阈值"选一边继续下降，不再产生线段。
+     */
+    private void collectTreeSegments(
+            List<TrainingSimulationResponse.TreeNode> nodes,
+            int nodeIndex,
+            int revealed,
+            int xIndex,
+            int yIndex,
+            double[] featureMeans,
+            double minX,
+            double maxX,
+            double minY,
+            double maxY,
+            List<List<List<Double>>> segments) {
+        if (nodeIndex < 0 || nodeIndex >= nodes.size()) {
+            return;
+        }
+        TrainingSimulationResponse.TreeNode node = nodes.get(nodeIndex);
+        Integer featureIndex = node.getFeatureIndex();
+        Integer splitOrder = node.getSplitOrder();
+        if (featureIndex == null
+                || node.getLeftId() == null
+                || node.getRightId() == null
+                || splitOrder == null
+                || splitOrder < 0
+                || splitOrder >= revealed) {
+            return;
+        }
+        double threshold = node.getThreshold() == null ? 0.0 : node.getThreshold();
+        if (featureIndex == xIndex) {
+            segments.add(Arrays.asList(
+                    Arrays.asList(round(threshold), round(minY)),
+                    Arrays.asList(round(threshold), round(maxY))));
+            collectTreeSegments(nodes, node.getLeftId(), revealed, xIndex, yIndex,
+                    featureMeans, minX, threshold, minY, maxY, segments);
+            collectTreeSegments(nodes, node.getRightId(), revealed, xIndex, yIndex,
+                    featureMeans, threshold, maxX, minY, maxY, segments);
+        } else if (featureIndex == yIndex) {
+            segments.add(Arrays.asList(
+                    Arrays.asList(round(minX), round(threshold)),
+                    Arrays.asList(round(maxX), round(threshold))));
+            collectTreeSegments(nodes, node.getLeftId(), revealed, xIndex, yIndex,
+                    featureMeans, minX, maxX, minY, threshold, segments);
+            collectTreeSegments(nodes, node.getRightId(), revealed, xIndex, yIndex,
+                    featureMeans, minX, maxX, threshold, maxY, segments);
+        } else {
+            int childId = featureMeans[featureIndex] <= threshold
+                    ? node.getLeftId()
+                    : node.getRightId();
+            collectTreeSegments(nodes, childId, revealed, xIndex, yIndex,
+                    featureMeans, minX, maxX, minY, maxY, segments);
+        }
+    }
+
+    private double rowsImpurity(List<DataRow> rows, DecisionTreeConfig config) {
+        Map<Integer, Integer> counts = new HashMap<>();
+        for (DataRow row : rows) {
+            counts.merge(row.classIndex(), 1, Integer::sum);
+        }
+        return nodeImpurity(counts, rows.size(), config);
+    }
+
+    private int rowsMajorityClass(List<DataRow> rows) {
+        Map<Integer, Integer> counts = new HashMap<>();
+        for (DataRow row : rows) {
+            counts.merge(row.classIndex(), 1, Integer::sum);
+        }
+        return majorityClass(counts);
+    }
+
+    // ==================== 随机森林：一步训练一棵树 ====================
+
+    private int forestSize(String parameters) {
+        return clampInt(getNumericParameter(parameters, "n_estimators", 5), 1, 20);
+    }
+
+    /** 一步训练一棵树：在当前森林上再加一棵，然后重新评估投票结果 */
+    private StepResult trainRandomForestStep(
+            Dataset dataset,
+            String parameters,
+            TrainingSimulationResponse.ModelData modelData) {
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        applyMatrixMetadata(modelData, data, "random_forest");
+        List<List<Integer>> votes = ensureVotes(data, modelData);
+        List<Double> importanceSums = ensureImportanceSums(data, modelData);
+        int trained = modelData.getTreeCount() == null ? 0 : modelData.getTreeCount();
+        int target = forestSize(parameters);
+        // 一步只训练一棵树
+        if (trained < target) {
+            trainOneForestTree(data, getDecisionTreeConfig(parameters), votes, importanceSums, trained);
+            modelData.setTreeCount(trained + 1);
+        }
+        return evaluateRandomForest(dataset, parameters, modelData);
+    }
+
+    /** 把森林补到 targetTrees 棵（一次性训练用）；已经训练过的树不会重训 */
+    private TrainingSimulationResponse.ModelData buildRandomForest(
+            Dataset dataset,
+            String parameters,
+            TrainingSimulationResponse.ModelData modelData,
+            int targetTrees) {
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        applyMatrixMetadata(modelData, data, "random_forest");
+        List<List<Integer>> votes = ensureVotes(data, modelData);
+        List<Double> importanceSums = ensureImportanceSums(data, modelData);
+        int trained = modelData.getTreeCount() == null ? 0 : modelData.getTreeCount();
+        DecisionTreeConfig config = getDecisionTreeConfig(parameters);
+        for (int index = trained; index < targetTrees; index++) {
+            trainOneForestTree(data, config, votes, importanceSums, index);
+            modelData.setTreeCount(index + 1);
+        }
+        return modelData;
+    }
+
+    /** 票数矩阵按数据行对齐；形状不对（旧会话/换数据集）就重建，并从第 0 棵树重新开始 */
+    private List<List<Integer>> ensureVotes(
+            DataMatrix data,
+            TrainingSimulationResponse.ModelData modelData) {
+        List<List<Integer>> votes = modelData.getVoteCounts();
+        if (votes == null || votes.size() != data.rows.size()) {
+            votes = emptyVotes(data);
+            modelData.setVoteCounts(votes);
+            modelData.setTreeCount(0);
+        }
+        return votes;
+    }
+
+    private List<Double> ensureImportanceSums(
+            DataMatrix data,
+            TrainingSimulationResponse.ModelData modelData) {
+        List<Double> sums = modelData.getImportanceSums();
+        if (sums == null || sums.size() != data.featureCount()) {
+            sums = zeroWeights(data.featureCount());
+            modelData.setImportanceSums(sums);
+            modelData.setTreeCount(0);
+        }
+        return sums;
+    }
+
+    private List<List<Integer>> emptyVotes(DataMatrix data) {
+        int classCount = Math.max(1, data.classNames.size());
+        List<List<Integer>> votes = new ArrayList<>(data.rows.size());
+        for (int i = 0; i < data.rows.size(); i++) {
+            List<Integer> row = new ArrayList<>(classCount);
+            for (int c = 0; c < classCount; c++) {
+                row.add(0);
+            }
+            votes.add(row);
+        }
+        return votes;
+    }
+
+    /**
+     * 训练一棵树：bootstrap 抽样 + 每个节点随机抽 sqrt(m) 个维度（随机森林的去相关手段），
+     * 然后让整棵树对全部样本投票，票数累加到 voteCounts，重要性累加到 importanceSums。
+     */
+    private void trainOneForestTree(
+            DataMatrix data,
+            DecisionTreeConfig config,
+            List<List<Integer>> votes,
+            List<Double> importanceSums,
+            int treeIndex) {
+        Random random = new Random(FOREST_SEED + treeIndex * 7919L);
+        List<DataRow> sample = bootstrapRows(data.rows, random);
+        if (sample.isEmpty()) {
+            return;
+        }
+        List<TrainingSimulationResponse.TreeNode> tree = buildDecisionTree(sample, data.featureNames, config, random);
+        for (int i = 0; i < data.rows.size(); i++) {
+            int predicted = predictWithTree(tree, data.rows.get(i));
+            List<Integer> row = votes.get(i);
+            if (predicted >= 0 && predicted < row.size()) {
+                row.set(predicted, row.get(predicted) + 1);
+            }
+        }
+        List<Double> treeImportance = treeImportance(tree, data.featureCount());
+        for (int j = 0; j < importanceSums.size() && j < treeImportance.size(); j++) {
+            importanceSums.set(j, importanceSums.get(j) + treeImportance.get(j));
+        }
+    }
+
+    private List<DataRow> bootstrapRows(List<DataRow> rows, Random random) {
+        List<DataRow> sample = new ArrayList<>(rows.size());
+        for (int i = 0; i < rows.size(); i++) {
+            sample.add(rows.get(random.nextInt(rows.size())));
+        }
+        return sample;
+    }
+
+    /** 每个节点随机抽 max(1, sqrt(维度数)) 个候选维度，这是随机森林和单纯 bagging 的区别所在 */
+    private List<Integer> randomFeatureSubset(int featureCount, Random random) {
+        int size = Math.max(1, (int) Math.round(Math.sqrt(Math.max(1, featureCount))));
+        List<Integer> indices = new ArrayList<>(featureCount);
+        for (int i = 0; i < featureCount; i++) {
+            indices.add(i);
+        }
+        Collections.shuffle(indices, random);
+        return new ArrayList<>(indices.subList(0, Math.min(size, featureCount)));
+    }
+
+    /** 用一棵完整的树预测单个样本 */
+    private int predictWithTree(List<TrainingSimulationResponse.TreeNode> tree, DataRow row) {
+        if (tree == null || tree.isEmpty()) {
+            return 0;
+        }
+        TrainingSimulationResponse.TreeNode node = tree.get(0);
+        int guard = 0;
+        while (guard++ < tree.size()) {
+            Integer featureIndex = node.getFeatureIndex();
+            if (featureIndex == null || node.getLeftId() == null || node.getRightId() == null) {
+                break;
+            }
+            boolean left = row.features()[featureIndex] <= node.getThreshold();
+            int nextId = left ? node.getLeftId() : node.getRightId();
+            if (nextId < 0 || nextId >= tree.size()) {
+                break;
+            }
+            node = tree.get(nextId);
+        }
+        return node.getClassIndex() == null ? 0 : node.getClassIndex();
+    }
+
+    /** 一棵树的重要性：各分裂节点按样本占比加权的不纯度下降，归一到 1 */
+    private List<Double> treeImportance(List<TrainingSimulationResponse.TreeNode> tree, int featureCount) {
+        double[] importance = new double[featureCount];
+        if (tree.isEmpty() || featureCount == 0) {
+            return toDoubleList(importance);
+        }
+        int totalSamples = tree.get(0).getSamples() == null ? 0 : tree.get(0).getSamples();
+        if (totalSamples <= 0) {
+            return toDoubleList(importance);
+        }
+        for (TrainingSimulationResponse.TreeNode node : tree) {
+            Integer featureIndex = node.getFeatureIndex();
+            if (featureIndex == null || featureIndex < 0 || featureIndex >= featureCount) {
+                continue;
+            }
+            if (node.getLeftId() == null || node.getRightId() == null) {
+                continue;
+            }
+            TrainingSimulationResponse.TreeNode left = tree.get(node.getLeftId());
+            TrainingSimulationResponse.TreeNode right = tree.get(node.getRightId());
+            int nodeSamples = node.getSamples() == null ? 0 : node.getSamples();
+            if (nodeSamples <= 0) {
+                continue;
+            }
+            double childImpurity = (
+                    (left.getSamples() == null ? 0 : left.getSamples())
+                            * (left.getImpurity() == null ? 0.0 : left.getImpurity())
+                    + (right.getSamples() == null ? 0 : right.getSamples())
+                            * (right.getImpurity() == null ? 0.0 : right.getImpurity())
+            ) / nodeSamples;
+            double decrease = Math.max(0.0,
+                    (node.getImpurity() == null ? 0.0 : node.getImpurity()) - childImpurity);
+            importance[featureIndex] += ((double) nodeSamples / totalSamples) * decrease;
+        }
+        double sum = 0.0;
+        for (double value : importance) {
+            sum += value;
+        }
+        if (sum > 0) {
+            for (int i = 0; i < importance.length; i++) {
+                importance[i] /= sum;
+            }
+        }
+        return toDoubleList(importance);
+    }
+
+    private List<Double> toDoubleList(double[] values) {
+        List<Double> list = new ArrayList<>(values.length);
+        for (double value : values) {
+            list.add(value);
+        }
+        return list;
+    }
+
+    private StepResult evaluateRandomForest(
+            Dataset dataset,
+            String parameters,
+            TrainingSimulationResponse.ModelData modelData) {
+        DataMatrix data = loadDataMatrix(dataset, TargetMode.SUPERVISED);
+        applyMatrixMetadata(modelData, data, "random_forest");
+        int treeCount = modelData.getTreeCount() == null ? 0 : modelData.getTreeCount();
+        List<List<Integer>> votes = modelData.getVoteCounts();
+        if (treeCount <= 0 || votes == null || votes.size() != data.rows.size()) {
+            // 还没有任何树：用多数类作为基线预测（与"0 次分裂的决策树"一致）
+            int majority = rowsMajorityClass(data.rows);
+            List<Integer> assignments = new ArrayList<>(data.rows.size());
+            int correct = 0;
+            for (DataRow row : data.rows) {
+                assignments.add(majority);
+                if (row.classIndex() == majority) {
+                    correct += 1;
+                }
+            }
+            modelData.setAssignments(assignments);
+            modelData.setFeatureImportances(List.of());
+            double baseline = (double) correct / Math.max(1, data.rows.size());
+            return new StepResult(modelData, round(1.0 - baseline), round(baseline), "Accuracy");
+        }
+
+        List<Integer> assignments = new ArrayList<>(data.rows.size());
+        int correct = 0;
+        for (int i = 0; i < data.rows.size(); i++) {
+            int predicted = argmax(votes.get(i));
+            assignments.add(predicted);
+            if (predicted == data.rows.get(i).classIndex()) {
                 correct += 1;
             }
         }
-        double accuracy = data.points.isEmpty() ? 0.0 : (double) correct / data.points.size();
-        return new StepResult(modelData, round(Math.max(0.0, split.impurity)), round(accuracy), "Accuracy");
+        modelData.setAssignments(assignments);
+        modelData.setFeatureImportances(forestImportances(data, modelData));
+
+        double accuracy = (double) correct / Math.max(1, data.rows.size());
+        // 随机森林用"错误率"作为损失
+        return new StepResult(modelData, round(1.0 - accuracy), round(accuracy), "Accuracy");
+    }
+
+    private int argmax(List<Integer> counts) {
+        int best = 0;
+        int bestCount = -1;
+        for (int i = 0; i < counts.size(); i++) {
+            int count = counts.get(i) == null ? 0 : counts.get(i);
+            if (count > bestCount) {
+                bestCount = count;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private List<TrainingSimulationResponse.FeatureImportance> forestImportances(
+            DataMatrix data,
+            TrainingSimulationResponse.ModelData modelData) {
+        List<TrainingSimulationResponse.FeatureImportance> importances = new ArrayList<>();
+        List<Double> sums = modelData.getImportanceSums();
+        int treeCount = modelData.getTreeCount() == null ? 0 : modelData.getTreeCount();
+        if (sums == null || sums.size() != data.featureCount() || treeCount <= 0) {
+            return importances;
+        }
+        double total = 0.0;
+        for (double value : sums) {
+            total += value;
+        }
+        for (int j = 0; j < sums.size(); j++) {
+            TrainingSimulationResponse.FeatureImportance importance = new TrainingSimulationResponse.FeatureImportance();
+            importance.setFeature(data.featureNames.get(j));
+            importance.setImportance(round(total <= 0 ? 0.0 : sums.get(j) / total));
+            importances.add(importance);
+        }
+        importances.sort((left, right) -> Double.compare(right.getImportance(), left.getImportance()));
+        return importances;
     }
 
     private StepResult trainSvm(Dataset dataset, String parameters, TrainingSimulationResponse.ModelData modelData) {
@@ -887,6 +1842,341 @@ public class TrainingSimulationService {
         return new StepResult(modelData, round((loss / Math.max(1, data.points.size())) + regularization), round(accuracy), "Accuracy");
     }
 
+    // ==================== 全维度数据层 ====================
+
+    /**
+     * 数据集在训练时使用的两个"默认投影"维度。
+     * 规则与 {@link DatasetService#getAllDatasets} 的投影保持一致，
+     * 决策树 / SVM 这两条尚未全维化的路径也复用这里，避免两处规则漂移。
+     */
+    private List<String> trainingAxes(Dataset dataset) {
+        List<FeatureInfo> features = parseFeatures(dataset.getFeatures());
+        String labelName = features.stream()
+                .filter(feature -> "label".equals(feature.type))
+                .map(feature -> feature.name)
+                .findFirst()
+                .orElse(null);
+        String xName = preferredFeature(features, List.of("rm", "x", "petal_length", "sepal_length"));
+        String yName = preferredFeature(features, List.of("y", "petal_width", "sepal_width"));
+
+        if (xName == null) {
+            xName = firstNonLabelFeature(features, null);
+        }
+        if (yName == null && labelName != null) {
+            yName = labelName;
+        }
+        if (yName == null) {
+            yName = firstNonLabelFeature(features, xName);
+        }
+        return Arrays.asList(xName, yName);
+    }
+
+    private String firstNonLabelFeature(List<FeatureInfo> features, String excludedName) {
+        return features.stream()
+                .filter(feature -> !"label".equals(feature.type))
+                .map(feature -> feature.name)
+                .filter(name -> excludedName == null || !excludedName.equals(name))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private enum TargetMode {
+        /** 监督学习：用 label 列当目标；没有 label 列时把最后一维当目标（回归退化场景） */
+        SUPERVISED,
+        /** 无监督：所有数值维都是特征，不需要目标 */
+        NONE
+    }
+
+    private record DataRow(double[] features, double target, double classValue, int classIndex) {}
+
+    /**
+     * 全维度训练矩阵：所有数值维度 + 逐维 z-score 参数。
+     * <p>
+     * 用 z-score 而不是 min-max，除了量级差异（b=396.9 / crim=0.006）下梯度更稳，
+     * 还让"其余维度固定在均值"在归一化空间里恰好等于 0，投影公式退化成只用所选两维系数的直线。
+     */
+    private static final class DataMatrix {
+        private final List<String> featureNames;
+        private final List<DataRow> rows;
+        private final double[] means;
+        private final double[] scales;
+        private final double[] mins;
+        private final double[] maxs;
+        private final double targetMean;
+        private final double targetScale;
+        private final String targetName;
+        private final List<String> classNames;
+
+        private DataMatrix(
+                List<String> featureNames,
+                List<DataRow> rows,
+                double[] means,
+                double[] scales,
+                double[] mins,
+                double[] maxs,
+                double targetMean,
+                double targetScale,
+                String targetName,
+                List<String> classNames) {
+            this.featureNames = featureNames;
+            this.rows = rows;
+            this.means = means;
+            this.scales = scales;
+            this.mins = mins;
+            this.maxs = maxs;
+            this.targetMean = targetMean;
+            this.targetScale = targetScale;
+            this.targetName = targetName;
+            this.classNames = classNames;
+        }
+
+        private int featureCount() {
+            return featureNames.size();
+        }
+
+        private double range(int index) {
+            return Math.max(EPSILON, maxs[index] - mins[index]);
+        }
+
+        private int featureIndex(String name) {
+            return name == null ? -1 : featureNames.indexOf(name);
+        }
+
+        private double normalizeFeature(int index, double raw) {
+            return (raw - means[index]) / Math.max(EPSILON, scales[index]);
+        }
+
+        private double denormalizeFeature(int index, double normalized) {
+            return normalized * Math.max(EPSILON, scales[index]) + means[index];
+        }
+
+        private double normalizeTarget(double raw) {
+            return (raw - targetMean) / Math.max(EPSILON, targetScale);
+        }
+
+        private double denormalizeTarget(double normalized) {
+            return normalized * Math.max(EPSILON, targetScale) + targetMean;
+        }
+    }
+
+    private DataMatrix loadDataMatrix(Dataset dataset, TargetMode mode) {
+        List<FeatureInfo> declared = parseFeatures(dataset.getFeatures());
+        List<LinkedHashMap<String, Object>> rawRows = parseRows(dataset.getDataContent());
+        String labelName = declared.stream()
+                .filter(feature -> "label".equals(feature.type))
+                .map(feature -> feature.name)
+                .findFirst()
+                .orElse(null);
+
+        List<String> featureNames = new ArrayList<>();
+        for (FeatureInfo feature : declared) {
+            if ("label".equals(feature.type)) {
+                continue;
+            }
+            if (isNumericColumn(rawRows, feature.name)) {
+                featureNames.add(feature.name);
+            }
+        }
+
+        String targetName = null;
+        if (mode == TargetMode.SUPERVISED) {
+            if (labelName != null) {
+                targetName = labelName;
+            } else if (!featureNames.isEmpty()) {
+                // 没有标签列时退化为"最后一维当目标"，并从特征里剔除，避免目标泄漏
+                targetName = featureNames.remove(featureNames.size() - 1);
+            }
+        }
+
+        int featureCount = featureNames.size();
+        int rowCount = rawRows.size();
+        double[][] values = new double[rowCount][featureCount];
+        double[] targetValues = new double[rowCount];
+        double[] classValues = new double[rowCount];
+        int[] classIndexes = new int[rowCount];
+        double[] sums = new double[featureCount];
+        double[] sumSquares = new double[featureCount];
+        int[] counts = new int[featureCount];
+        Map<String, Integer> labelMap = new HashMap<>();
+
+        for (int i = 0; i < rowCount; i++) {
+            LinkedHashMap<String, Object> row = rawRows.get(i);
+            for (int j = 0; j < featureCount; j++) {
+                Double value = asDouble(row.get(featureNames.get(j)));
+                if (value == null) {
+                    values[i][j] = Double.NaN; // 缺失值稍后用列均值补齐，保证行下标与前端 dataPoints 对齐
+                } else {
+                    values[i][j] = value;
+                    sums[j] += value;
+                    sumSquares[j] += value * value;
+                    counts[j] += 1;
+                }
+            }
+            Object rawLabel = targetName == null ? null : row.get(targetName);
+            int classIndex = rawLabel == null ? 0 : toClassIndex(rawLabel, labelMap);
+            classIndexes[i] = classIndex;
+            classValues[i] = classIndex == 0 ? 0.0 : 1.0;
+            Double numericTarget = asDouble(rawLabel);
+            targetValues[i] = numericTarget != null ? numericTarget : classValues[i];
+        }
+
+        double[] means = new double[featureCount];
+        double[] scales = new double[featureCount];
+        double[] mins = new double[featureCount];
+        double[] maxs = new double[featureCount];
+        for (int j = 0; j < featureCount; j++) {
+            means[j] = counts[j] == 0 ? 0.0 : sums[j] / counts[j];
+            double variance = counts[j] == 0
+                    ? 0.0
+                    : Math.max(0.0, sumSquares[j] / counts[j] - means[j] * means[j]);
+            scales[j] = Math.max(EPSILON, Math.sqrt(variance));
+            mins[j] = Double.MAX_VALUE;
+            maxs[j] = -Double.MAX_VALUE;
+        }
+        for (int i = 0; i < rowCount; i++) {
+            for (int j = 0; j < featureCount; j++) {
+                if (Double.isNaN(values[i][j])) {
+                    values[i][j] = means[j];
+                }
+                mins[j] = Math.min(mins[j], values[i][j]);
+                maxs[j] = Math.max(maxs[j], values[i][j]);
+            }
+        }
+        for (int j = 0; j < featureCount; j++) {
+            if (mins[j] > maxs[j]) { // 没有任何数据时退化成均值点
+                mins[j] = means[j];
+                maxs[j] = means[j];
+            }
+        }
+
+        double targetMean = 0.0;
+        double targetVariance = 0.0;
+        if (rowCount > 0) {
+            double targetSum = 0.0;
+            for (double value : targetValues) {
+                targetSum += value;
+            }
+            targetMean = targetSum / rowCount;
+            for (double value : targetValues) {
+                targetVariance += (value - targetMean) * (value - targetMean);
+            }
+            targetVariance /= rowCount;
+        }
+        double targetScale = Math.max(EPSILON, Math.sqrt(targetVariance));
+
+        List<DataRow> rows = new ArrayList<>(rowCount);
+        for (int i = 0; i < rowCount; i++) {
+            rows.add(new DataRow(values[i], targetValues[i], classValues[i], classIndexes[i]));
+        }
+        return new DataMatrix(
+                featureNames, rows, means, scales, mins, maxs, targetMean, targetScale, targetName,
+                buildClassNames(classIndexes, labelMap));
+    }
+
+    /** 类别编号 → 原始标签名；数值型标签（没有进 labelMap）就用数字本身兜底 */
+    private List<String> buildClassNames(int[] classIndexes, Map<String, Integer> labelMap) {
+        int maxIndex = -1;
+        for (int classIndex : classIndexes) {
+            maxIndex = Math.max(maxIndex, classIndex);
+        }
+        if (maxIndex < 0) {
+            return List.of();
+        }
+        String[] names = new String[maxIndex + 1];
+        for (int i = 0; i <= maxIndex; i++) {
+            names[i] = String.valueOf(i);
+        }
+        for (Map.Entry<String, Integer> entry : labelMap.entrySet()) {
+            int index = entry.getValue() == null ? -1 : entry.getValue();
+            if (index >= 0 && index < names.length) {
+                names[index] = entry.getKey();
+            }
+        }
+        return new ArrayList<>(Arrays.asList(names));
+    }
+
+    /** 声明为数值、且数据里至少一半能解析成数字的列才算特征；纯文本列（如某些标签）不参与训练 */
+    private boolean isNumericColumn(List<LinkedHashMap<String, Object>> rows, String name) {
+        int total = 0;
+        int numeric = 0;
+        for (LinkedHashMap<String, Object> row : rows) {
+            if (!row.containsKey(name)) {
+                continue;
+            }
+            total += 1;
+            if (asDouble(row.get(name)) != null) {
+                numeric += 1;
+            }
+        }
+        return total > 0 && numeric * 2 >= total;
+    }
+
+    private double[] weightsArray(TrainingSimulationResponse.ModelData modelData, int size) {
+        return weightsArray(modelData.getWeights(), size);
+    }
+
+    private double[] weightsArray(List<Double> weights, int size) {
+        double[] result = new double[Math.max(0, size)];
+        if (weights == null) {
+            return result;
+        }
+        for (int index = 0; index < result.length && index < weights.size(); index++) {
+            Double value = weights.get(index);
+            result[index] = value == null ? 0.0 : value;
+        }
+        return result;
+    }
+
+    private List<Double> roundWeights(double[] weights) {
+        List<Double> rounded = new ArrayList<>(weights.length);
+        for (double weight : weights) {
+            rounded.add(round(weight));
+        }
+        return rounded;
+    }
+
+    private double dotNormalized(DataMatrix data, double[] weights, DataRow row) {
+        double sum = 0.0;
+        int size = Math.min(weights.length, data.featureCount());
+        for (int index = 0; index < size; index++) {
+            sum += weights[index] * data.normalizeFeature(index, row.features[index]);
+        }
+        return sum;
+    }
+
+    /** 默认投影下的纵轴维度：优先取数据集默认投影轴，其次取第一个未被占用的维度 */
+    private int defaultProjectionIndex(DataMatrix data, Dataset dataset, int axis, int excludedIndex) {
+        List<String> axes = trainingAxes(dataset);
+        int preferred = axis < axes.size() ? data.featureIndex(axes.get(axis)) : -1;
+        if (preferred >= 0 && preferred != excludedIndex) {
+            return preferred;
+        }
+        for (int candidate = 0; candidate < data.featureCount(); candidate++) {
+            if (candidate != excludedIndex) {
+                return candidate;
+            }
+        }
+        return -1;
+    }
+
+    private List<List<Double>> defaultRegressionLine(
+            DataMatrix data,
+            Dataset dataset,
+            List<Double> weights,
+            double bias) {
+        return buildFullRegressionLine(data, weights, bias, defaultProjectionIndex(data, dataset, 0, -1));
+    }
+
+    private List<List<Double>> defaultBoundary(
+            DataMatrix data,
+            Dataset dataset,
+            List<Double> weights,
+            double bias) {
+        int xIndex = defaultProjectionIndex(data, dataset, 0, -1);
+        int yIndex = defaultProjectionIndex(data, dataset, 1, xIndex);
+        return buildFullLinearBoundary(data, xIndex, yIndex, weights, bias);
+    }
+
     private DataSet2d loadDataSet(Dataset dataset, Algorithm algorithm) {
         List<DataPoint2d> points = new ArrayList<>();
         List<FeatureInfo> features = parseFeatures(dataset.getFeatures());
@@ -895,9 +2185,9 @@ public class TrainingSimulationService {
                 .map(feature -> feature.name)
                 .findFirst()
                 .orElse(null);
-        String preferredX = preferredFeature(features, List.of("rm", "x", "petal_length", "sepal_length"));
-        String preferredY = preferredFeature(features, List.of("y", "petal_width", "sepal_width"));
-        boolean useTargetAsY = preferredY == null && labelName != null;
+        List<String> axes = trainingAxes(dataset);
+        String preferredX = axes.get(0);
+        String preferredY = axes.get(1);
         Map<String, Integer> labelMap = new HashMap<>();
 
         for (LinkedHashMap<String, Object> row : parseRows(dataset.getDataContent())) {
@@ -907,9 +2197,6 @@ public class TrainingSimulationService {
             double classValue = classIndex == 0 ? 0.0 : 1.0;
             Double x = preferredX == null ? null : asDouble(row.get(preferredX));
             Double y = preferredY == null ? null : asDouble(row.get(preferredY));
-            if (y == null && useTargetAsY) {
-                y = target;
-            }
 
             if (x == null || y == null) {
                 List<Double> numericValues = row.entrySet().stream()
@@ -982,29 +2269,54 @@ public class TrainingSimulationService {
         }
     }
 
-    private List<TrainingSimulationResponse.Centroid> initializeCentroids(List<DataPoint2d> points, int k) {
-        DataStats stats = new DataStats(points);
+    private List<TrainingSimulationResponse.Centroid> initializeCentroids(DataMatrix data, int k) {
         List<TrainingSimulationResponse.Centroid> centroids = new ArrayList<>();
+        int featureCount = data.featureCount();
         for (int index = 0; index < k; index++) {
-            double x = stats.minX + stats.rangeX() * (index + 1) / (k + 1);
-            double y = stats.minY + stats.rangeY() * ((index % 2) + 1) / 3.0;
-            TrainingSimulationResponse.Centroid centroid = new TrainingSimulationResponse.Centroid();
-            centroid.setX(round(x));
-            centroid.setY(round(y));
-            centroid.setClusterId(index);
-            centroids.add(centroid);
+            List<Double> values = new ArrayList<>(featureCount);
+            for (int j = 0; j < featureCount; j++) {
+                double position = (index + 1.0) / (k + 1.0);
+                // 奇数维加一点错位，避免所有质心落在同一条对角线上
+                double jitter = j % 2 == 0 ? 0.0 : (((index % 2) + 1) / 3.0 - 0.5) * 0.6;
+                values.add(round(data.mins[j] + data.range(j) * clamp(position + jitter, 0.05, 0.95)));
+            }
+            centroids.add(buildCentroid(values, index));
         }
         return centroids;
     }
 
-    private List<Integer> assignClusters(List<DataPoint2d> points, List<TrainingSimulationResponse.Centroid> centroids) {
-        List<Integer> assignments = new ArrayList<>();
-        for (DataPoint2d point : points) {
+    private TrainingSimulationResponse.Centroid buildCentroid(List<Double> values, int clusterId) {
+        TrainingSimulationResponse.Centroid centroid = new TrainingSimulationResponse.Centroid();
+        centroid.setClusterId(clusterId);
+        centroid.setValues(values);
+        centroid.setX(values.isEmpty() ? 0.0 : values.get(0));
+        centroid.setY(values.size() < 2 ? 0.0 : values.get(1));
+        return centroid;
+    }
+
+    /** 质心必须是本次数据集维度下算出来的：老会话里存的两维质心（没有 values）要重新初始化 */
+    private boolean isUsableCentroids(
+            List<TrainingSimulationResponse.Centroid> centroids,
+            int expectedCount,
+            int featureCount) {
+        if (centroids == null || centroids.isEmpty() || centroids.size() != expectedCount) {
+            return false;
+        }
+        for (TrainingSimulationResponse.Centroid centroid : centroids) {
+            if (centroid.getValues() == null || centroid.getValues().size() != featureCount) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private List<Integer> assignClusters(DataMatrix data, List<TrainingSimulationResponse.Centroid> centroids) {
+        List<Integer> assignments = new ArrayList<>(data.rows.size());
+        for (DataRow row : data.rows) {
             int bestIndex = 0;
             double bestDistance = Double.MAX_VALUE;
             for (int index = 0; index < centroids.size(); index++) {
-                TrainingSimulationResponse.Centroid centroid = centroids.get(index);
-                double distance = squaredDistance(point.x, point.y, centroid.getX(), centroid.getY());
+                double distance = normalizedSquaredDistance(data, row, centroids.get(index));
                 if (distance < bestDistance) {
                     bestDistance = distance;
                     bestIndex = index;
@@ -1015,163 +2327,52 @@ public class TrainingSimulationService {
         return assignments;
     }
 
+    /** 归一化空间里的平方距离：b=396.9 与 crim=0.006 这类量级差必须先按维度缩放再比较 */
+    private double normalizedSquaredDistance(
+            DataMatrix data,
+            DataRow row,
+            TrainingSimulationResponse.Centroid centroid) {
+        List<Double> values = centroid.getValues();
+        int featureCount = Math.min(values == null ? 0 : values.size(), data.featureCount());
+        double total = 0.0;
+        for (int j = 0; j < featureCount; j++) {
+            double diff = data.normalizeFeature(j, row.features[j]) - data.normalizeFeature(j, values.get(j));
+            total += diff * diff;
+        }
+        return total;
+    }
+
     private List<TrainingSimulationResponse.Centroid> recomputeCentroids(
-            List<DataPoint2d> points,
+            DataMatrix data,
             List<Integer> assignments,
             List<TrainingSimulationResponse.Centroid> previous) {
         double momentum = 0.35;
+        int featureCount = data.featureCount();
         List<TrainingSimulationResponse.Centroid> updated = new ArrayList<>();
         for (int clusterId = 0; clusterId < previous.size(); clusterId++) {
-            double sumX = 0.0;
-            double sumY = 0.0;
+            double[] sums = new double[featureCount];
             int count = 0;
-            for (int index = 0; index < points.size(); index++) {
-                if (assignments.get(index) == clusterId) {
-                    sumX += points.get(index).x;
-                    sumY += points.get(index).y;
-                    count += 1;
-                }
-            }
-            TrainingSimulationResponse.Centroid centroid = new TrainingSimulationResponse.Centroid();
-            centroid.setClusterId(clusterId);
-            double prevX = previous.get(clusterId).getX();
-            double prevY = previous.get(clusterId).getY();
-            if (count == 0) {
-                centroid.setX(prevX);
-                centroid.setY(prevY);
-            } else {
-                centroid.setX(round(prevX + (sumX / count - prevX) * momentum));
-                centroid.setY(round(prevY + (sumY / count - prevY) * momentum));
-            }
-            updated.add(centroid);
-        }
-        return updated;
-    }
-
-    private DecisionSplit findBestDecisionSplit(List<DataPoint2d> points, DecisionTreeConfig config) {
-        DecisionSplit best = null;
-        for (String feature : List.of("x", "y")) {
-            List<Double> values = points.stream()
-                    .map(point -> "x".equals(feature) ? point.x : point.y)
-                    .distinct()
-                    .sorted()
-                    .toList();
-            for (int index = 0; index < values.size() - 1; index++) {
-                double threshold = (values.get(index) + values.get(index + 1)) / 2.0;
-                if (!canSplit(points, feature, threshold, config.minSamplesSplit)) {
+            for (int index = 0; index < data.rows.size(); index++) {
+                if (assignments.get(index) != clusterId) {
                     continue;
                 }
-                DecisionSplit candidate = buildDecisionSplit(points, feature, threshold, config);
-                double projectedImpurity = projectedTreeImpurity(points, feature, threshold, config, 1);
-                candidate = new DecisionSplit(
-                        candidate.feature,
-                        candidate.threshold,
-                        projectedImpurity,
-                        candidate.leftClassIndex,
-                        candidate.rightClassIndex);
-                if (best == null || candidate.impurity < best.impurity) {
-                    best = candidate;
+                DataRow row = data.rows.get(index);
+                for (int j = 0; j < featureCount; j++) {
+                    sums[j] += row.features[j];
                 }
+                count += 1;
             }
-        }
-        if (best != null) {
-            return best;
-        }
-        return new DecisionSplit("x", points.get(0).x, nodeImpurity(points, config), majorityClass(points), majorityClass(points));
-    }
-
-    private DecisionSplit buildDecisionSplit(List<DataPoint2d> points, String feature, double threshold, DecisionTreeConfig config) {
-        Map<Integer, Integer> leftCounts = new HashMap<>();
-        Map<Integer, Integer> rightCounts = new HashMap<>();
-        int leftCount = 0;
-        int rightCount = 0;
-        for (DataPoint2d point : points) {
-            boolean left = ("x".equals(feature) ? point.x : point.y) <= threshold;
-            if (left) {
-                leftCount += 1;
-                leftCounts.merge(point.classIndex, 1, Integer::sum);
-            } else {
-                rightCount += 1;
-                rightCounts.merge(point.classIndex, 1, Integer::sum);
+            List<Double> previousValues = previous.get(clusterId).getValues();
+            List<Double> values = new ArrayList<>(featureCount);
+            for (int j = 0; j < featureCount; j++) {
+                double prev = previousValues != null && previousValues.size() > j
+                        ? previousValues.get(j)
+                        : data.means[j];
+                values.add(round(count == 0 ? prev : prev + (sums[j] / count - prev) * momentum));
             }
+            updated.add(buildCentroid(values, clusterId));
         }
-        double impurity = ((double) leftCount / points.size()) * nodeImpurity(leftCounts, leftCount, config)
-                + ((double) rightCount / points.size()) * nodeImpurity(rightCounts, rightCount, config);
-        return new DecisionSplit(
-                feature,
-                threshold,
-                impurity,
-                majorityClass(leftCounts),
-                majorityClass(rightCounts));
-    }
-
-    private boolean canSplit(List<DataPoint2d> points, String feature, double threshold, int minSamplesSplit) {
-        if (points.size() < minSamplesSplit) {
-            return false;
-        }
-        int leftCount = 0;
-        int rightCount = 0;
-        for (DataPoint2d point : points) {
-            if (isLeft(point, feature, threshold)) {
-                leftCount += 1;
-            } else {
-                rightCount += 1;
-            }
-        }
-        return leftCount > 0 && rightCount > 0;
-    }
-
-    private double projectedTreeImpurity(
-            List<DataPoint2d> points,
-            String feature,
-            double threshold,
-            DecisionTreeConfig config,
-            int depth) {
-        List<DataPoint2d> left = new ArrayList<>();
-        List<DataPoint2d> right = new ArrayList<>();
-        for (DataPoint2d point : points) {
-            if (isLeft(point, feature, threshold)) {
-                left.add(point);
-            } else {
-                right.add(point);
-            }
-        }
-        return ((double) left.size() / points.size()) * bestSubtreeImpurity(left, config, depth + 1)
-                + ((double) right.size() / points.size()) * bestSubtreeImpurity(right, config, depth + 1);
-    }
-
-    private double bestSubtreeImpurity(List<DataPoint2d> points, DecisionTreeConfig config, int depth) {
-        if (points.isEmpty() || depth > config.maxDepth || points.size() < config.minSamplesSplit) {
-            return nodeImpurity(points, config);
-        }
-
-        double best = nodeImpurity(points, config);
-        for (String feature : List.of("x", "y")) {
-            List<Double> values = points.stream()
-                    .map(point -> "x".equals(feature) ? point.x : point.y)
-                    .distinct()
-                    .sorted()
-                    .toList();
-            for (int index = 0; index < values.size() - 1; index++) {
-                double threshold = (values.get(index) + values.get(index + 1)) / 2.0;
-                if (canSplit(points, feature, threshold, config.minSamplesSplit)) {
-                    best = Math.min(best, projectedTreeImpurity(points, feature, threshold, config, depth));
-                }
-            }
-        }
-        return best;
-    }
-
-    private boolean isLeft(DataPoint2d point, String feature, double threshold) {
-        return ("x".equals(feature) ? point.x : point.y) <= threshold;
-    }
-
-    private double nodeImpurity(List<DataPoint2d> points, DecisionTreeConfig config) {
-        Map<Integer, Integer> counts = new HashMap<>();
-        for (DataPoint2d point : points) {
-            counts.merge(point.classIndex, 1, Integer::sum);
-        }
-        return nodeImpurity(counts, points.size(), config);
+        return updated;
     }
 
     private double nodeImpurity(Map<Integer, Integer> counts, int count, DecisionTreeConfig config) {
@@ -1205,42 +2406,11 @@ public class TrainingSimulationService {
         return impurity;
     }
 
-    private int majorityClass(List<DataPoint2d> points) {
-        Map<Integer, Integer> counts = new HashMap<>();
-        for (DataPoint2d point : points) {
-            counts.merge(point.classIndex, 1, Integer::sum);
-        }
-        return majorityClass(counts);
-    }
-
     private int majorityClass(Map<Integer, Integer> counts) {
         return counts.entrySet().stream()
                 .max((left, right) -> Integer.compare(left.getValue(), right.getValue()))
                 .map(Map.Entry::getKey)
                 .orElse(0);
-    }
-
-    private int predictDecisionSplit(DataPoint2d point, DecisionSplit split) {
-        boolean left = isLeft(point, split.feature, split.threshold);
-        return left ? split.leftClassIndex : split.rightClassIndex;
-    }
-
-    private void applyDecisionSplitModel(
-            TrainingSimulationResponse.ModelData modelData,
-            DataStats stats,
-            DecisionSplit split) {
-        modelData.setSplitFeature(split.feature);
-        modelData.setSplitThreshold(round(split.threshold));
-        modelData.setSplitImpurity(round(split.impurity));
-        if ("x".equals(split.feature)) {
-            modelData.setDecisionBoundary(List.of(
-                    Arrays.asList(round(split.threshold), round(stats.minY)),
-                    Arrays.asList(round(split.threshold), round(stats.maxY))));
-        } else {
-            modelData.setDecisionBoundary(List.of(
-                    Arrays.asList(round(stats.minX), round(split.threshold)),
-                    Arrays.asList(round(stats.maxX), round(split.threshold))));
-        }
     }
 
     private List<List<Double>> buildRegressionLine(DataStats stats, double normalizedWeight, double normalizedBias) {
@@ -1261,6 +2431,74 @@ public class TrainingSimulationService {
         double y1 = stats.denormalizeY((-bias - w1 * stats.normalizeX(x1)) / w2);
         double y2 = stats.denormalizeY((-bias - w1 * stats.normalizeX(x2)) / w2);
         return Arrays.asList(Arrays.asList(round(x1), round(y1)), Arrays.asList(round(x2), round(y2)));
+    }
+
+    // ==================== 全维度模型在任意两维平面上的投影 ====================
+
+    /**
+     * 全维度回归线在 (xIndex, 目标) 平面上的投影。
+     * <p>
+     * 隐藏维度固定在均值，z-score 后它们的贡献恰好为 0，
+     * 于是曲线就是"用该维度的斜率画线"：ŷ = 反归一化(w[x] * x̃ + b)。
+     */
+    private List<List<Double>> buildFullRegressionLine(
+            DataMatrix data,
+            List<Double> weights,
+            double bias,
+            int xIndex) {
+        if (data.rows.isEmpty() || xIndex < 0 || xIndex >= data.featureCount()) {
+            return null;
+        }
+        double[] coefficients = weightsArray(weights, data.featureCount());
+        double minX = data.mins[xIndex];
+        double maxX = data.maxs[xIndex];
+        double y1 = data.denormalizeTarget(coefficients[xIndex] * data.normalizeFeature(xIndex, minX) + bias);
+        double y2 = data.denormalizeTarget(coefficients[xIndex] * data.normalizeFeature(xIndex, maxX) + bias);
+        return Arrays.asList(
+                Arrays.asList(round(minX), round(y1)),
+                Arrays.asList(round(maxX), round(y2)));
+    }
+
+    /**
+     * 全维度线性决策边界在 (xIndex, yIndex) 平面上的投影：
+     * w[x]·x̃ + w[y]·ỹ + b = 0（隐藏维度固定在均值，贡献为 0）。
+     */
+    private List<List<Double>> buildFullLinearBoundary(
+            DataMatrix data,
+            int xIndex,
+            int yIndex,
+            List<Double> weights,
+            double bias) {
+        if (data.rows.isEmpty() || xIndex < 0 || yIndex < 0 || xIndex == yIndex) {
+            return null;
+        }
+        if (xIndex >= data.featureCount() || yIndex >= data.featureCount()) {
+            return null;
+        }
+        double[] coefficients = weightsArray(weights, data.featureCount());
+        double wx = coefficients[xIndex];
+        double wy = coefficients[yIndex];
+        double minX = data.mins[xIndex];
+        double maxX = data.maxs[xIndex];
+        double minY = data.mins[yIndex];
+        double maxY = data.maxs[yIndex];
+
+        if (Math.abs(wy) < EPSILON) {
+            if (Math.abs(wx) < EPSILON) {
+                return null; // 两个维度的系数都是 0，无法确定边界
+            }
+            double x = data.denormalizeFeature(xIndex, -bias / wx);
+            return Arrays.asList(
+                    Arrays.asList(round(x), round(minY)),
+                    Arrays.asList(round(x), round(maxY)));
+        }
+        double y1 = data.denormalizeFeature(
+                yIndex, (-bias - wx * data.normalizeFeature(xIndex, minX)) / wy);
+        double y2 = data.denormalizeFeature(
+                yIndex, (-bias - wx * data.normalizeFeature(xIndex, maxX)) / wy);
+        return Arrays.asList(
+                Arrays.asList(round(minX), round(y1)),
+                Arrays.asList(round(maxX), round(y2)));
     }
 
     private List<List<Double>> buildSampledBoundary(DataStats stats, BoundaryScorer scorer) {
@@ -1362,34 +2600,32 @@ public class TrainingSimulationService {
     }
 
     private double approximateSilhouette(
-            List<DataPoint2d> points,
+            DataMatrix data,
             List<Integer> assignments,
             List<TrainingSimulationResponse.Centroid> centroids) {
-        if (centroids.size() <= 1 || points.isEmpty()) {
+        if (centroids.size() <= 1 || data.rows.isEmpty()) {
             return 0.0;
         }
         double total = 0.0;
-        for (int index = 0; index < points.size(); index++) {
-            DataPoint2d point = points.get(index);
+        for (int index = 0; index < data.rows.size(); index++) {
+            DataRow row = data.rows.get(index);
             int ownCluster = assignments.get(index);
-            TrainingSimulationResponse.Centroid own = centroids.get(ownCluster);
-            double a = Math.sqrt(squaredDistance(point.x, point.y, own.getX(), own.getY()));
+            double a = Math.sqrt(normalizedSquaredDistance(data, row, centroids.get(ownCluster)));
             double b = Double.MAX_VALUE;
             for (int clusterId = 0; clusterId < centroids.size(); clusterId++) {
                 if (clusterId == ownCluster) {
                     continue;
                 }
-                TrainingSimulationResponse.Centroid other = centroids.get(clusterId);
-                b = Math.min(b, Math.sqrt(squaredDistance(point.x, point.y, other.getX(), other.getY())));
+                b = Math.min(b, Math.sqrt(normalizedSquaredDistance(data, row, centroids.get(clusterId))));
             }
             total += (b - a) / Math.max(a, b);
         }
-        return clamp((total / points.size() + 1.0) / 2.0, 0.0, 0.99);
+        return clamp((total / data.rows.size() + 1.0) / 2.0, 0.0, 0.99);
     }
 
-    private double normalizeInertia(double inertia, List<DataPoint2d> points) {
-        DataStats stats = new DataStats(points);
-        double scale = Math.max(EPSILON, points.size() * (stats.rangeX() * stats.rangeX() + stats.rangeY() * stats.rangeY()));
+    /** 归一化空间中每维标准差为 1，簇内平方距离量级约为维度数，故用 n * m * 4 归一到 0~1 */
+    private double normalizeInertia(double inertia, int sampleCount, int featureCount) {
+        double scale = Math.max(EPSILON, sampleCount * Math.max(1, featureCount) * 4.0);
         return inertia / scale;
     }
 
@@ -1506,6 +2742,10 @@ public class TrainingSimulationService {
             int maxDepth = clampInt(getNumericParameter(parameters, "maxDepth", 5), 1, 20);
             return maxDepth * 2;
         }
+        // 随机森林一步训练一棵树，总步数就是树的数量
+        if (algorithm != null && "random_forest".equals(algorithm.getName())) {
+            return forestSize(parameters);
+        }
         return DEFAULT_TOTAL_STEPS;
     }
 
@@ -1546,6 +2786,9 @@ public class TrainingSimulationService {
         }
         if ("decision_tree".equals(name)) {
             return "Gini";
+        }
+        if ("random_forest".equals(name)) {
+            return "Error";
         }
         return "Loss";
     }
@@ -1685,11 +2928,14 @@ public class TrainingSimulationService {
         return res;
     }
 
-    private String buildFeaturesJson(List<String> selectedFeatures, Dataset dataset) {
+    private String buildFeaturesJson(List<String> selectedFeatures, Dataset dataset, String labelName) {
         List<FeatureInfo> original = parseFeatures(dataset.getFeatures());
         List<Map<String, Object>> out = new ArrayList<>();
         for (FeatureInfo f : original) {
-            if (selectedFeatures.contains(f.name())) {
+            boolean keep = selectedFeatures.contains(f.name())
+                    || "label".equals(f.type())
+                    || (labelName != null && labelName.equals(f.name()));
+            if (keep) {
                 Map<String, Object> m = new LinkedHashMap<>();
                 m.put("name", f.name());
                 m.put("type", f.type());
@@ -1737,7 +2983,13 @@ public class TrainingSimulationService {
 
     private record DataSet2d(List<DataPoint2d> points) {}
 
-    private record DecisionSplit(String feature, double threshold, double impurity, int leftClassIndex, int rightClassIndex) {}
+    private record DecisionSplit(
+            String feature,
+            int featureIndex,
+            double threshold,
+            double impurity,
+            int leftClassIndex,
+            int rightClassIndex) {}
 
     private record DecisionTreeConfig(int maxDepth, int minSamplesSplit, String criterion) {}
 
