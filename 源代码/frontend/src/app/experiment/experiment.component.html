@@ -61,6 +61,27 @@
               <span class="pca-value">{{ ratio * 100 | number:'1.1-1' }}%</span>
             </div>
           </div>
+
+          <div class="pca-section-label" *ngIf="pca.labels.length">主成分含义</div>
+          <div class="pca-meanings" *ngIf="pca.labels.length">
+            <div class="pca-meaning" *ngFor="let label of pca.labels">
+              <div class="pca-meaning-head">
+                <span class="pca-pc">PC{{ label.index + 1 }}</span>
+                <span class="pca-tag">{{ label.shortLabel }}</span>
+                <span class="pca-meaning-ratio" *ngIf="label.ratio !== null">
+                  {{ label.ratio * 100 | number:'1.1-1' }}%
+                </span>
+              </div>
+              <p class="pca-meaning-desc">{{ label.description }}</p>
+              <div class="pca-chips" *ngIf="label.dominant.length">
+                <span class="pca-chip" *ngFor="let f of label.dominant"
+                      [class.pca-chip-neg]="f.loading < 0">
+                  {{ f.name }}
+                  <b>{{ f.loading >= 0 ? '+' : '' }}{{ f.loading | number:'1.2-2' }}</b>
+                </span>
+              </div>
+            </div>
+          </div>
           <div class="pca-total">
             累计解释率
             <strong>{{ (pca.cumulative[pca.cumulative.length - 1] || 0) * 100 | number:'1.1-1' }}%</strong>

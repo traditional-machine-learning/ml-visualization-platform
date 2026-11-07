@@ -12,6 +12,7 @@ import {
 import * as echarts from 'echarts';
 import { Algorithm, DataPoint, Dataset, FeatureInfo, TrainingModelData, TrainingProjection, TrainingState } from '../../models/algorithm.model';
 import { ApiService } from '../../services/api.service';
+import { describePcaComponents, PcaComponentLabel } from '../../utils/pca-labels';
 
 @Component({
   selector: 'app-visualization-canvas',
@@ -418,11 +419,17 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     }));
   }
 
-  /** 轴名带上该主成分的方差解释率，例如 "PC1 · 72.9%" */
+  /** 轴名带上该主成分的方差解释率与含义标签，例如 "PC1 · 72.9% · petal·正向综合轴" */
   private pcaAxisLabel(index: number): string {
-    const ratios = this.trainingState?.modelData?.pcaExplainedVariance;
-    const ratio = ratios && ratios.length > index ? ratios[index] : null;
-    return ratio == null ? `PC${index + 1}` : `PC${index + 1} · ${(ratio * 100).toFixed(1)}%`;
+    const label = this.pcaLabels[index];
+    const ratio = label?.ratio ?? null;
+    const base = ratio == null ? `PC${index + 1}` : `PC${index + 1} · ${(ratio * 100).toFixed(1)}%`;
+    return label?.shortLabel ? `${base} · ${label.shortLabel}` : base;
+  }
+
+  /** 当前训练结果的各主成分含义标签 */
+  get pcaLabels(): PcaComponentLabel[] {
+    return describePcaComponents(this.trainingState?.modelData);
   }
 
   get pcaDimensions(): number {
