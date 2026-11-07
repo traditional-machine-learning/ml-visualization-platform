@@ -81,9 +81,16 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
         this.modelRevision += 1;
       }
     }
+    if (changes['algorithm'] && !changes['algorithm'].firstChange) {
+      // 换算法时退出三维视图，避免非 PCA 算法停留在旧画布上
+      this.pca3dMode = false;
+    }
     if (changes['dataset'] || changes['algorithm'] || changes['trainingState']) {
       this.requestProjection();
       this.renderChart();
+      if (this.pca3dMode) {
+        setTimeout(() => this.renderPca3d(), 30);
+      }
     }
   }
 
@@ -250,6 +257,9 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   @HostListener('window:resize')
   onResize(): void {
     this.chart?.resize();
+    if (this.pca3dMode) {
+      this.renderPca3d();
+    }
   }
 
   getUniqueLabels(): string[] {
@@ -285,21 +295,8 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     let datasets: any[] = [];
 
     if (modelData?.pcaTransformed && modelData.pcaTransformed.length) {
-      const transformed = modelData.pcaTransformed as number[][];
-      const points = transformed.map((p, i) => [p[0], p[1]]);
-      datasets = [{
-        name: 'PCA投影',
-        type: 'scatter',
-        symbolSize: 7,
-        data: points,
-        itemStyle: {
-          color: this.getLegendColor('Samples'),
-          borderColor: 'rgba(255,255,255,0.45)',
-          borderWidth: 1,
-          shadowBlur: 5,
-          shadowColor: `${this.getLegendColor('Samples')}50`
-        }
-      }];
+      // PCA 视图：按原始标签分组着色，让降维后的类别分离一眼可见
+      datasets = this.buildPcaSeries(modelData);
     } else {
       const grouped = this.groupPoints();
       datasets = Object.entries(grouped).map(([label, points]) => ({
@@ -327,8 +324,8 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
 
     const overlaySeries = this.getOverlaySeries();
     // 轴名在 setOption 之前取好，避免 tooltip 闭包读到后续变更
-    const xAxisLabel = this.isPcaView ? 'PC1' : this.getAxisDisplayName(this.selectedXName, 'Feature X');
-    const yAxisLabel = this.isPcaView ? 'PC2' : this.getAxisDisplayName(this.selectedYName, 'Feature Y');
+    const xAxisLabel = this.isPcaView ? this.pcaAxisLabel(0) : this.getAxisDisplayName(this.selectedXName, 'Feature X');
+    const yAxisLabel = this.isPcaView ? this.pcaAxisLabel(1) : this.getAxisDisplayName(this.selectedYName, 'Feature Y');
 
     this.chart.setOption({
       animation: true,
@@ -383,6 +380,214 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     this.renderImportanceChart();
     // ensure chart sizes correctly
     setTimeout(() => this.chart?.resize(), 50);
+  }
+
+  /** PCA 视图下按原始标签分组，保留每个点的类别颜色 */
+  private buildPcaSeries(modelData: TrainingModelData): any[] {
+    const transformed = modelData.pcaTransformed as number[][];
+    const grouped: Record<string, number[][]> = {};
+    transformed.forEach((point, index) => {
+      const raw = this.dataset?.dataPoints?.[index];
+      const key = this.resolvePointLabel(raw?.label, raw?.clusterId, index);
+      if (!grouped[key]) {
+        grouped[key] = [];
+      }
+      grouped[key].push([point[0], point[1]]);
+    });
+
+    return Object.entries(grouped).map(([label, points]) => ({
+      name: label,
+      type: 'scatter',
+      symbolSize: 7,
+      data: points,
+      itemStyle: {
+        color: this.getLegendColor(label),
+        borderColor: 'rgba(255,255,255,0.45)',
+        borderWidth: 1,
+        shadowBlur: 5,
+        shadowColor: `${this.getLegendColor(label)}50`
+      },
+      emphasis: {
+        itemStyle: {
+          borderColor: '#ffffff',
+          borderWidth: 1.5,
+          shadowBlur: 12,
+          shadowColor: `${this.getLegendColor(label)}80`
+        }
+      }
+    }));
+  }
+
+  /** 轴名带上该主成分的方差解释率，例如 "PC1 · 72.9%" */
+  private pcaAxisLabel(index: number): string {
+    const ratios = this.trainingState?.modelData?.pcaExplainedVariance;
+    const ratio = ratios && ratios.length > index ? ratios[index] : null;
+    return ratio == null ? `PC${index + 1}` : `PC${index + 1} · ${(ratio * 100).toFixed(1)}%`;
+  }
+
+  get pcaDimensions(): number {
+    const points = this.trainingState?.modelData?.pcaTransformed;
+    return points && points.length ? (points[0]?.length ?? 0) : 0;
+  }
+
+  get pca3DAvailable(): boolean {
+    return this.isPcaView && this.pcaDimensions >= 3;
+  }
+
+  // ==================== PCA 三维视图 ====================
+
+  pca3dMode = false;
+  private pca3dHost?: ElementRef<HTMLCanvasElement>;
+  /** 拖拽旋转的欧拉角（弧度） */
+  private pca3dYaw = -0.62;
+  private pca3dPitch = 0.38;
+  private pca3dDragging = false;
+  private pca3dLast = { x: 0, y: 0 };
+
+  @ViewChild('pca3dHost')
+  set pca3dHostRef(host: ElementRef<HTMLCanvasElement> | undefined) {
+    this.pca3dHost = host;
+    if (host) {
+      this.renderPca3d();
+    }
+  }
+
+  togglePca3d(): void {
+    this.pca3dMode = !this.pca3dMode;
+    if (this.pca3dMode) {
+      setTimeout(() => this.renderPca3d(), 30);
+    } else {
+      setTimeout(() => this.chart?.resize(), 30);
+    }
+  }
+
+  onPca3dPointerDown(event: PointerEvent): void {
+    this.pca3dDragging = true;
+    this.pca3dLast = { x: event.clientX, y: event.clientY };
+    (event.target as HTMLElement).setPointerCapture?.(event.pointerId);
+  }
+
+  onPca3dPointerMove(event: PointerEvent): void {
+    if (!this.pca3dDragging) {
+      return;
+    }
+    const dx = event.clientX - this.pca3dLast.x;
+    const dy = event.clientY - this.pca3dLast.y;
+    this.pca3dLast = { x: event.clientX, y: event.clientY };
+    this.pca3dYaw += dx * 0.01;
+    this.pca3dPitch = Math.max(-1.2, Math.min(1.2, this.pca3dPitch + dy * 0.01));
+    this.renderPca3d();
+  }
+
+  onPca3dPointerUp(): void {
+    this.pca3dDragging = false;
+  }
+
+  resetPca3dView(): void {
+    this.pca3dYaw = -0.62;
+    this.pca3dPitch = 0.38;
+    this.renderPca3d();
+  }
+
+  /** 自绘三维散点：等距投影 + 拖拽旋转，不依赖额外的 WebGL 库 */
+  private renderPca3d(): void {
+    const canvas = this.pca3dHost?.nativeElement;
+    const points = this.trainingState?.modelData?.pcaTransformed;
+    if (!canvas || !points?.length || (points[0]?.length ?? 0) < 3) {
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.max(320, Math.round(rect.width || canvas.clientWidth || 480));
+    const height = Math.max(260, Math.round(rect.height || canvas.clientHeight || 360));
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+
+    // 归一化到 [-1, 1]，避免 PC1 与 PC3 量级差异把图形压扁
+    const bounds = [0, 1, 2].map((axis) => {
+      const values = points.map((p) => p[axis] ?? 0);
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = max - min || 1;
+      return { min, span, mid: (min + max) / 2 };
+    });
+    const normalized = points.map((p) =>
+      [0, 1, 2].map((axis) => ((p[axis] ?? 0) - bounds[axis].mid) / (bounds[axis].span / 2))
+    );
+
+    const cosYaw = Math.cos(this.pca3dYaw);
+    const sinYaw = Math.sin(this.pca3dYaw);
+    const cosPitch = Math.cos(this.pca3dPitch);
+    const sinPitch = Math.sin(this.pca3dPitch);
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const radius = Math.min(width, height) * 0.34;
+    const focal = 3.4;
+
+    const project = (p: number[]) => {
+      const ry = p[0] * cosYaw + p[2] * sinYaw;
+      const rz = -p[0] * sinYaw + p[2] * cosYaw;
+      const py = p[1] * cosPitch - rz * sinPitch;
+      const pz = p[1] * sinPitch + rz * cosPitch;
+      const scale = focal / (focal + pz);
+      return {
+        x: centerX + ry * radius * scale,
+        y: centerY - py * radius * scale,
+        depth: pz
+      };
+    };
+
+    // 坐标轴
+    const axisEnds: [number[], string][] = [
+      [[1.15, 0, 0], this.pcaAxisLabel(0)],
+      [[0, 1.15, 0], this.pcaAxisLabel(1)],
+      [[0, 0, 1.15], this.pcaAxisLabel(2)]
+    ];
+    const origin = project([0, 0, 0]);
+    ctx.lineWidth = 1;
+    axisEnds.forEach(([end, label]) => {
+      const tip = project(end);
+      ctx.strokeStyle = 'rgba(100,116,139,0.45)';
+      ctx.beginPath();
+      ctx.moveTo(origin.x, origin.y);
+      ctx.lineTo(tip.x, tip.y);
+      ctx.stroke();
+      ctx.fillStyle = '#475569';
+      ctx.font = '600 11px "Segoe UI", system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, tip.x, tip.y - 10);
+    });
+
+    // 按深度排序，远的先画
+    const drawables = normalized
+      .map((p, index) => ({ ...project(p), index }))
+      .sort((a, b) => b.depth - a.depth);
+
+    drawables.forEach((point) => {
+      const raw = this.dataset?.dataPoints?.[point.index];
+      const label = this.resolvePointLabel(raw?.label, raw?.clusterId, point.index);
+      const color = this.getLegendColor(label);
+      const depthScale = 0.78 + (1 - Math.min(1, Math.max(0, (point.depth + 1) / 2))) * 0.5;
+      const radiusPoint = 3.6 * depthScale;
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, radiusPoint, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.globalAlpha = 0.92;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.lineWidth = 0.8;
+      ctx.strokeStyle = 'rgba(255,255,255,0.65)';
+      ctx.stroke();
+    });
   }
 
   private renderImportanceChart(): void {

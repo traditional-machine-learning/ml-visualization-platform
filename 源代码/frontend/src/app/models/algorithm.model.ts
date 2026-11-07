@@ -80,6 +80,12 @@ export interface TrainingModelData {
   assignments?: number[];
   pcaComponents?: number[][];
   pcaTransformed?: number[][];
+  /** 各主成分方差解释率（0~1） */
+  pcaExplainedVariance?: number[];
+  /** 累计方差解释率（0~1） */
+  pcaCumulativeVariance?: number[];
+  /** 中心化所用的各维度均值，与 featureNames 对齐 */
+  pcaMean?: number[];
   featureImportances?: FeatureImportance[];
   /** 全维度模型自述：算法种类 / 训练所用维度 / 监督目标维度 */
   modelKind?: string;

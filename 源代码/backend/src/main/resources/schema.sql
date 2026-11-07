@@ -104,3 +104,8 @@ INSERT IGNORE INTO algorithm (name, display_name, description, category, type, p
 
 -- Update SVM to add iterations parameter if it already exists
 UPDATE algorithm SET parameters = '[{"name":"kernel","displayName":"核函数","type":"select","default":"rbf","options":["linear","rbf","poly"]},{"name":"c","displayName":"正则化参数C","type":"number","default":1,"min":0.1,"max":10,"step":0.1},{"name":"gamma","displayName":"核系数gamma","type":"number","default":0.1,"min":0.001,"max":1,"step":0.001},{"name":"iterations","displayName":"迭代次数","type":"number","default":100,"min":10,"max":1000,"step":10}]' WHERE name = 'svm';
+
+-- PCA 只用于降维可视化，主成分数限定 2~3（2D 平面图 / 3D 立体图）
+UPDATE algorithm SET parameters = '[{"name":"n_components","displayName":"主成分数（2D/3D）","type":"number","default":2,"min":2,"max":3,"step":1}]',
+    description = '主成分分析：把高维数据投影到 2~3 个主成分上，用于降维可视化与方差解释率分析'
+WHERE name = 'pca';

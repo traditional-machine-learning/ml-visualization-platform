@@ -94,6 +94,12 @@ public class TrainingSimulationResponse {
         private Double splitImpurity;
         private List<List<Double>> pcaComponents;
         private List<List<Double>> pcaTransformed;
+        /** 各主成分的方差解释率（0~1，按主成分顺序） */
+        private List<Double> pcaExplainedVariance;
+        /** 前 i 个主成分的累计方差解释率（0~1） */
+        private List<Double> pcaCumulativeVariance;
+        /** 中心化时使用的各维度均值（与 featureNames 对齐） */
+        private List<Double> pcaMean;
         private List<FeatureImportance> featureImportances;
 
         public List<List<Double>> getDecisionBoundary() { return decisionBoundary; }
@@ -136,6 +142,12 @@ public class TrainingSimulationResponse {
         public void setPcaComponents(List<List<Double>> pcaComponents) { this.pcaComponents = pcaComponents; }
         public List<List<Double>> getPcaTransformed() { return pcaTransformed; }
         public void setPcaTransformed(List<List<Double>> pcaTransformed) { this.pcaTransformed = pcaTransformed; }
+        public List<Double> getPcaExplainedVariance() { return pcaExplainedVariance; }
+        public void setPcaExplainedVariance(List<Double> pcaExplainedVariance) { this.pcaExplainedVariance = pcaExplainedVariance; }
+        public List<Double> getPcaCumulativeVariance() { return pcaCumulativeVariance; }
+        public void setPcaCumulativeVariance(List<Double> pcaCumulativeVariance) { this.pcaCumulativeVariance = pcaCumulativeVariance; }
+        public List<Double> getPcaMean() { return pcaMean; }
+        public void setPcaMean(List<Double> pcaMean) { this.pcaMean = pcaMean; }
         public List<FeatureImportance> getFeatureImportances() { return featureImportances; }
         public void setFeatureImportances(List<FeatureImportance> featureImportances) { this.featureImportances = featureImportances; }
     }
