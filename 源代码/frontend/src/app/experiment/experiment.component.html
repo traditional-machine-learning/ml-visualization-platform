@@ -50,7 +50,8 @@
       <app-param-panel
         [algorithm]="selectedAlgorithm"
         [parameterValues]="parameterValues"
-        (parameterChange)="onParameterChange($event.paramName, $event.value)">
+        (parameterChange)="onParameterChange($event.paramName, $event.value)"
+        (resetDefaults)="onResetDefaultParameters()">
       </app-param-panel>
 
       <mat-card class="control-card">

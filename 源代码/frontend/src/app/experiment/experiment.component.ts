@@ -150,6 +150,19 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     this.refreshInsightPanels();
   }
 
+  /**
+   * 将当前算法的全部超参数恢复为定义中的默认值。
+   * 与单个参数调整一致，只刷新参数与派生状态，不打断正在进行的训练。
+   */
+  onResetDefaultParameters(): void {
+    if (!this.selectedAlgorithm) {
+      return;
+    }
+    this.parameterValues = this.buildParameterValues(this.selectedAlgorithm, {});
+    this.trainingState.totalSteps = this.getTotalSteps();
+    this.refreshInsightPanels();
+  }
+
   onLoadCase(caseId: string): void {
     if (this.useMockFallback) {
       this.applyDemoCase(caseId);
