@@ -31,7 +31,7 @@
         </mat-form-field>
       </span>
 
-      <button mat-stroked-button class="view-toggle" *ngIf="pca3DAvailable" (click)="togglePca3d()">
+      <button mat-stroked-button class="view-toggle" *ngIf="pca3dToggleVisible" (click)="togglePca3d()">
         <mat-icon>{{ pca3dMode ? 'grid_on' : 'view_in_ar' }}</mat-icon>
         {{ pca3dMode ? '切回 2D' : '切换 3D' }}
       </button>
@@ -47,14 +47,14 @@
       <div class="axis-hint" *ngIf="isPcaView">
         <mat-icon class="axis-hint-icon">insights</mat-icon>
         <span>
-          已把数据投影到 {{ pcaDimensions }} 个主成分上，散点按原始类别着色{{ pca3DAvailable ? '；可切换到 3D 视图拖拽旋转观察' : '' }}。
+          已把数据投影到 {{ pcaDimensions }} 个主成分上，散点按原始类别着色{{ pcaSingleAxis ? '；当前只有 1 个主成分，散点沿 PC1 单轴分布，纵向仅作轻微错位方便观察' : (pca3DAvailable ? '；可切换到 3D 视图拖拽旋转观察' : '') }}。
         </span>
       </div>
 
-      <div class="chart-area" [class.chart-area-3d]="pca3dMode">
-        <div #chartHost class="chart-frame" *ngIf="!pca3dMode"></div>
+      <div class="chart-area" [class.chart-area-3d]="pca3dActive">
+        <div #chartHost class="chart-frame" *ngIf="!pca3dActive"></div>
 
-        <div class="pca3d-frame" *ngIf="pca3dMode">
+        <div class="pca3d-frame" *ngIf="pca3dActive">
           <canvas #pca3dHost
                   class="pca3d-canvas"
                   (pointerdown)="onPca3dPointerDown($event)"

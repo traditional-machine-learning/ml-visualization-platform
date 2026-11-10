@@ -74,12 +74,22 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     if (changes['dataset']) {
       // 数据集可能先后到达两次：列表接口的投影版本，随后是详情接口的全维度版本
       this.syncAxisSelection(changes['dataset'].currentValue);
+      // 切换数据集后旧的三维点云已失效，回到二维视图
+      this.pca3dMode = false;
     }
     if (changes['trainingState']) {
-      const modelData = (changes['trainingState'].currentValue as TrainingState | null)?.modelData;
+      const state = changes['trainingState'].currentValue as TrainingState | null;
+      // 点「开始」的瞬间就回到二维，不必等新结果返回
+      if (state?.status === 'training') {
+        this.pca3dMode = false;
+      }
+      const modelData = state?.modelData;
       if (modelData !== this.lastModelData) {
         this.lastModelData = modelData;
         this.modelRevision += 1;
+        // 每次拿到新的训练结果（含改主成分数后重训）都重置到二维视图，
+        // 避免停留在 3D 且新结果只有 1~2 个主成分时看不到「切回 2D」按钮
+        this.pca3dMode = false;
       }
     }
     if (changes['algorithm'] && !changes['algorithm'].firstChange) {
@@ -89,7 +99,7 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     if (changes['dataset'] || changes['algorithm'] || changes['trainingState']) {
       this.requestProjection();
       this.renderChart();
-      if (this.pca3dMode) {
+      if (this.pca3dActive) {
         setTimeout(() => this.renderPca3d(), 30);
       }
     }
@@ -258,7 +268,7 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   @HostListener('window:resize')
   onResize(): void {
     this.chart?.resize();
-    if (this.pca3dMode) {
+    if (this.pca3dActive) {
       this.renderPca3d();
     }
   }
@@ -325,8 +335,12 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
 
     const overlaySeries = this.getOverlaySeries();
     // 轴名在 setOption 之前取好，避免 tooltip 闭包读到后续变更
+    const singleAxis = this.pcaSingleAxis;
     const xAxisLabel = this.isPcaView ? this.pcaAxisLabel(0) : this.getAxisDisplayName(this.selectedXName, 'Feature X');
-    const yAxisLabel = this.isPcaView ? this.pcaAxisLabel(1) : this.getAxisDisplayName(this.selectedYName, 'Feature Y');
+    // 只有 1 个主成分时，Y 轴没有对应的主成分，仅用于把重叠的点轻微分散开
+    const yAxisLabel = singleAxis
+      ? '（无第二主成分）'
+      : this.isPcaView ? this.pcaAxisLabel(1) : this.getAxisDisplayName(this.selectedYName, 'Feature Y');
 
     this.chart.setOption({
       animation: true,
@@ -343,7 +357,8 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
         },
         formatter: (params: any) => {
           if (Array.isArray(params.value)) {
-            return `${params.seriesName}<br/>${xAxisLabel}: ${params.value[0]}<br/>${yAxisLabel}: ${params.value[1]}`;
+            const head = `${params.seriesName}<br/>${xAxisLabel}: ${params.value[0]}`;
+            return singleAxis ? head : `${head}<br/>${yAxisLabel}: ${params.value[1]}`;
           }
           return params.seriesName;
         }
@@ -370,9 +385,11 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
         nameLocation: 'middle',
         nameGap: 44,
         nameTextStyle: { color: '#1e293b', fontWeight: 600, fontSize: 11 },
-        axisLine: { lineStyle: { color: '#94A3B8' } },
-        axisLabel: { color: '#334155', fontSize: 10, fontWeight: 500 },
-        splitLine: { lineStyle: { color: 'rgba(15,23,42,0.06)' } }
+        ...(singleAxis ? { min: -1, max: 1 } : {}),
+        axisLine: singleAxis ? { show: false } : { lineStyle: { color: '#94A3B8' } },
+        axisTick: singleAxis ? { show: false } : {},
+        axisLabel: singleAxis ? { show: false } : { color: '#334155', fontSize: 10, fontWeight: 500 },
+        splitLine: singleAxis ? { show: false } : { lineStyle: { color: 'rgba(15,23,42,0.06)' } }
       },
       series: [...datasets, ...overlaySeries]
     }, true);
@@ -386,6 +403,8 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   /** PCA 视图下按原始标签分组，保留每个点的类别颜色 */
   private buildPcaSeries(modelData: TrainingModelData): any[] {
     const transformed = modelData.pcaTransformed as number[][];
+    const singleAxis = this.pcaSingleAxis;
+    // 单主成分时把点沿 X 轴排开，Y 只做固定幅度的微量错位（Y 轴已隐藏刻度并固定范围）
     const grouped: Record<string, number[][]> = {};
     transformed.forEach((point, index) => {
       const raw = this.dataset?.dataPoints?.[index];
@@ -393,7 +412,8 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
       if (!grouped[key]) {
         grouped[key] = [];
       }
-      grouped[key].push([point[0], point[1]]);
+      const y = singleAxis ? ((index % 9) - 4) * 0.05 : (point[1] ?? 0);
+      grouped[key].push([point[0] ?? 0, y]);
     });
 
     return Object.entries(grouped).map(([label, points]) => ({
@@ -441,6 +461,21 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
     return this.isPcaView && this.pcaDimensions >= 3;
   }
 
+  /** 只有 1 个主成分：二维图上仅 X 轴（PC1）有含义 */
+  get pcaSingleAxis(): boolean {
+    return this.isPcaView && this.pcaDimensions === 1;
+  }
+
+  /** 真正渲染三维画布：即便状态位残留，没有 3 维数据也一律退回二维 */
+  get pca3dActive(): boolean {
+    return this.pca3dMode && this.pca3DAvailable;
+  }
+
+  /** 当前是否该显示视角切换按钮：可切 3D，或正处于 3D 需要「切回 2D」 */
+  get pca3dToggleVisible(): boolean {
+    return this.pca3DAvailable || this.pca3dMode;
+  }
+
   // ==================== PCA 三维视图 ====================
 
   pca3dMode = false;
@@ -460,8 +495,12 @@ export class VisualizationCanvasComponent implements AfterViewInit, OnChanges, O
   }
 
   togglePca3d(): void {
+    // 没有 3 维数据时只允许「切回 2D」，不允许进入空白的三维画布
+    if (!this.pca3DAvailable && !this.pca3dMode) {
+      return;
+    }
     this.pca3dMode = !this.pca3dMode;
-    if (this.pca3dMode) {
+    if (this.pca3dActive) {
       setTimeout(() => this.renderPca3d(), 30);
     } else {
       setTimeout(() => this.chart?.resize(), 30);
