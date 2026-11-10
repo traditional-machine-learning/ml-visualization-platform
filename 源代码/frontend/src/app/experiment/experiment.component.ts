@@ -1,7 +1,7 @@
 import { Component, OnDestroy, OnInit } from '@angular/core';
 import { NavigationEnd, Router } from '@angular/router';
 import { filter, forkJoin, Subscription } from 'rxjs';
-import { Algorithm, Dataset, TrainingSimulationResponse, TrainingState } from '../models/algorithm.model';
+import { Algorithm, Dataset, TrainingModelData, TrainingSimulationResponse, TrainingState } from '../models/algorithm.model';
 import {
   CaseGuidanceState,
   EvaluationPanelState,
@@ -13,6 +13,17 @@ import { ApiService } from '../services/api.service';
 import { ExperimentContextService } from '../services/experiment-context.service';
 import { environment } from '../../environments/environment';
 import { TrainingLogEntry } from '../components/training-log/training-log.component';
+import { describePcaComponents, PcaComponentLabel } from '../utils/pca-labels';
+
+/** PCA 结果摘要，供右侧信息面板展示方差解释率与载荷矩阵 */
+export interface PcaSummary {
+  k: number;
+  explained: number[];
+  cumulative: number[];
+  loadings: { name: string; values: number[] }[];
+  /** 每个主成分的含义标签（主导特征 + 轴类型） */
+  labels: PcaComponentLabel[];
+}
 
 @Component({
   selector: 'app-experiment',
@@ -43,6 +54,8 @@ export class ExperimentComponent implements OnInit, OnDestroy {
   explanationState: ModelExplanationState | null = null;
   trainingLog: TrainingLogEntry[] = [];
   statusBanner = '选择算法、数据集或引导式案例以开始。';
+  /** PCA 专用结果摘要（方差解释率 + 载荷矩阵），非 PCA 算法为 null */
+  pcaSummary: PcaSummary | null = null;
 
   private trainingTimer: ReturnType<typeof setInterval> | null = null;
   private stepInFlight = false;
@@ -107,6 +120,10 @@ export class ExperimentComponent implements OnInit, OnDestroy {
       }
     }
     return 8; // Fallback default
+  }
+
+  get isPcaAlgorithm(): boolean {
+    return this.selectedAlgorithm?.name === 'pca';
   }
 
   onAlgorithmSelect(algorithm: Algorithm): void {
@@ -290,6 +307,12 @@ export class ExperimentComponent implements OnInit, OnDestroy {
       return;
     }
 
+    // PCA 是一次性计算，没有逐步训练流程，直接走降维接口
+    if (this.isPcaAlgorithm) {
+      this.runPca();
+      return;
+    }
+
     const requestVersion = this.clearTrainingTimer();
     this.appendTrainingLog('Training request sent to backend.', 'neutral', this.trainingState.currentStep);
     this.apiService.startTraining(this.selectedAlgorithm.id, this.selectedDataset.id, this.parameterValues).subscribe({
@@ -313,6 +336,84 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     });
   }
 
+  /**
+   * 执行 PCA 降维。PCA 没有训练轮次，一次请求就返回全部结果，
+   * 因此这里不走轮询，也不需要 sessionId。
+   */
+  private runPca(): void {
+    if (!this.selectedAlgorithm || !this.selectedDataset) {
+      return;
+    }
+
+    const algorithmId = this.selectedAlgorithm.id;
+    const datasetId = this.selectedDataset.id;
+    const requestVersion = this.clearTrainingTimer();
+    this.trainingState = { ...this.trainingState, status: 'training' };
+    this.statusBanner = '正在计算主成分...';
+    this.appendTrainingLog(
+      `执行 PCA 降维：${this.selectedDataset.name}，主成分数 ${this.parameterValues['n_components'] ?? 2}`,
+      'neutral',
+      this.trainingState.currentStep
+    );
+    this.refreshInsightPanels();
+
+    this.apiService.startPca(algorithmId, datasetId, this.parameterValues).subscribe({
+      next: (response) => {
+        if (!this.isCurrentRequest(requestVersion)) {
+          return;
+        }
+        if (!response.success) {
+          this.handleTrainingError();
+          return;
+        }
+        this.applyTrainingResponse(response.data);
+        this.trainingState = { ...this.trainingState, status: 'completed' };
+
+        const summary = this.pcaSummary;
+        if (summary && summary.cumulative.length) {
+          const total = summary.cumulative[summary.cumulative.length - 1];
+          const detail = summary.explained
+            .map((ratio, index) => `PC${index + 1} ${(ratio * 100).toFixed(1)}%`)
+            .join('、');
+          this.appendTrainingLog(
+            `PCA 完成：${detail}，累计解释 ${(total * 100).toFixed(1)}% 方差`,
+            'success',
+            this.trainingState.currentStep
+          );
+          this.statusBanner = `PCA 降维完成，前 ${summary.k} 个主成分解释了 ${(total * 100).toFixed(1)}% 的方差。`;
+        } else {
+          this.appendTrainingLog('PCA 完成，但该数据集没有可用的数值特征。', 'warning', 0);
+          this.statusBanner = '该数据集缺少数值特征，无法执行 PCA。';
+        }
+        this.refreshInsightPanels();
+      },
+      error: () => {
+        if (this.isCurrentRequest(requestVersion)) {
+          this.handleTrainingError();
+        }
+      }
+    });
+  }
+
+  private buildPcaSummary(modelData?: TrainingModelData): PcaSummary | null {
+    if (!modelData?.pcaTransformed?.length || !modelData.pcaComponents?.length) {
+      return null;
+    }
+    const components = modelData.pcaComponents;
+    const names = modelData.featureNames ?? [];
+    const loadings = names.map((name, featureIndex) => ({
+      name,
+      values: components.map((component) => component[featureIndex] ?? 0)
+    }));
+    return {
+      k: components.length,
+      explained: modelData.pcaExplainedVariance ?? [],
+      cumulative: modelData.pcaCumulativeVariance ?? [],
+      loadings,
+      labels: describePcaComponents(modelData)
+    };
+  }
+
   onTrainStep(): void {
     if (!this.selectedAlgorithm || !this.selectedDataset) {
       return;
@@ -331,6 +432,11 @@ export class ExperimentComponent implements OnInit, OnDestroy {
       } else {
         this.trainingState.status = 'paused';
       }
+      return;
+    }
+
+    if (this.isPcaAlgorithm) {
+      this.runPca();
       return;
     }
 
@@ -426,6 +532,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
       accuracy: 0.36,
       scoreLabel: 'Accuracy'
     };
+    this.pcaSummary = null;
     if (resetSelections) {
       this.selectedAlgorithm = null;
       this.selectedDataset = null;
@@ -523,7 +630,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     // 决策树一步 = 一次分裂、随机森林一步 = 一棵树，总步数只有后端知道，必须用返回值；
     // 其余算法沿用参数推导出的步数
     const name = this.selectedAlgorithm?.name;
-    const totalSteps = (name === 'decision_tree' || name === 'random_forest') && response.totalSteps > 0
+    const totalSteps = (name === 'decision_tree' || name === 'random_forest' || name === 'pca') && response.totalSteps > 0
       ? response.totalSteps
       : this.getTotalSteps();
     this.trainingState = {
@@ -538,6 +645,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
       metrics: response.metrics,
       modelData: response.modelData
     };
+    this.pcaSummary = this.isPcaAlgorithm ? this.buildPcaSummary(response.modelData) : null;
     this.refreshInsightPanels();
   }
 

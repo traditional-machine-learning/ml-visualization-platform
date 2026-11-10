@@ -50,6 +50,11 @@ public class TrainingSimulationService {
         Algorithm algorithm = requireAlgorithm(algorithmId);
         Dataset dataset = requireDataset(datasetId);
 
+        // PCA 没有逐步训练过程，一次算完；统一在这里路由，兼容仍然调用 /train 的入口
+        if ("pca".equals(algorithm.getName())) {
+            return startPca(algorithmId, datasetId, parameters);
+        }
+
         int totalSteps = getTotalStepsFromParameters(parameters, algorithm);
         TrainingSession session = new TrainingSession();
         session.setAlgorithmId(algorithmId);
@@ -414,50 +419,77 @@ public class TrainingSimulationService {
     }
 
     // ----- Advanced features: PCA and Random Forest (simulated) -----
+    /**
+     * 执行一次完整的 PCA 降维（无迭代过程，一次算完）。
+     * n_components 允许 1~3：1~2 维用于平面散点图，3 维用于三维散点图。
+     * 返回载荷矩阵、降维后的坐标、各主成分方差解释率与累计解释率。
+     */
     public TrainingSimulationResponse startPca(Long algorithmId, Long datasetId, String parameters) {
         Algorithm algorithm = requireAlgorithm(algorithmId);
         Dataset dataset = requireDataset(datasetId);
+        String normalizedParams = normalizeParameters(parameters);
 
         TrainingSimulationResponse.ModelData modelData = new TrainingSimulationResponse.ModelData();
-        // parse numeric matrix from dataset
+        modelData.setModelKind("pca");
+
         List<LinkedHashMap<String, Object>> rows = parseRows(dataset.getDataContent());
         List<FeatureInfo> features = parseFeatures(dataset.getFeatures());
         List<String> numericNames = features.stream()
-                .filter(f -> !"label".equals(f.type()))
+                .filter(f -> !"label".equals(f.type()) && !"cluster".equals(f.type()))
                 .map(FeatureInfo::name)
                 .toList();
         double[][] matrix = buildNumericMatrix(rows, numericNames);
-        if (matrix.length == 0 || numericNames.size() == 0) {
-            modelData.setPcaComponents(List.of());
-            modelData.setPcaTransformed(List.of());
+
+        int requested = clampInt(getNumericParameter(normalizedParams, "n_components", 2), 1, 3);
+        int k = Math.min(requested, Math.max(1, numericNames.size()));
+
+        List<List<Double>> comps = new java.util.ArrayList<>();
+        List<List<Double>> transformed = new java.util.ArrayList<>();
+        List<Double> explained = new java.util.ArrayList<>();
+        List<Double> cumulative = new java.util.ArrayList<>();
+        List<Double> means = new java.util.ArrayList<>();
+
+        if (matrix.length == 0 || numericNames.isEmpty()) {
+            modelData.setFeatureNames(numericNames);
         } else {
-            int k = Math.min(2, numericNames.size());
             PcaResult pca = computePca(matrix, k);
-            // components: each component is array of loadings per original feature
-            List<List<Double>> comps = new java.util.ArrayList<>();
             for (double[] comp : pca.components) {
                 List<Double> row = new java.util.ArrayList<>();
                 for (double v : comp) row.add(round(v));
                 comps.add(row);
             }
-            List<List<Double>> transformed = new java.util.ArrayList<>();
             for (double[] proj : pca.transformed) {
                 List<Double> pt = new java.util.ArrayList<>();
                 for (double v : proj) pt.add(round(v));
                 transformed.add(pt);
             }
-            modelData.setPcaComponents(comps);
-            modelData.setPcaTransformed(transformed);
+            double total = pca.totalVariance;
+            double acc = 0.0;
+            for (double lambda : pca.eigenvalues) {
+                double ratio = total > 0 ? lambda / total : 0.0;
+                acc += ratio;
+                explained.add(round(ratio));
+                cumulative.add(round(Math.min(1.0, acc)));
+            }
+            for (double v : pca.mean) means.add(round(v));
+            modelData.setFeatureNames(numericNames);
         }
+
+        modelData.setPcaComponents(comps);
+        modelData.setPcaTransformed(transformed);
+        modelData.setPcaExplainedVariance(explained);
+        modelData.setPcaCumulativeVariance(cumulative);
+        modelData.setPcaMean(means);
 
         TrainingSimulationResponse response = new TrainingSimulationResponse();
         response.setAlgorithmId(algorithmId);
         response.setDatasetId(datasetId);
         response.setStatus("completed");
-        response.setCurrentStep(0);
-        response.setTotalSteps(0);
+        // PCA 一次算完：步数直接记为 k/k，界面不会出现"训练中"
+        response.setCurrentStep(k);
+        response.setTotalSteps(k);
         response.setLoss(0.0);
-        response.setAccuracy(0.0);
+        response.setAccuracy(cumulative.isEmpty() ? 0.0 : cumulative.get(cumulative.size() - 1));
         response.setScoreLabel("ExplainedVar");
         response.setModelData(modelData);
         return response;
@@ -2848,6 +2880,9 @@ public class TrainingSimulationService {
         double[][] components;
         double[][] transformed;
         double[] eigenvalues;
+        double[] mean;
+        /** 协方差矩阵的迹 = 各维度方差之和，用于计算方差解释率 */
+        double totalVariance;
     }
 
     // Compute top-k PCA components using power iteration on covariance matrix
@@ -2881,12 +2916,19 @@ public class TrainingSimulationService {
         double[][] covWorking = new double[m][m];
         for (int i = 0; i < m; i++) System.arraycopy(cov[i], 0, covWorking[i], 0, m);
 
+        // 总方差 = 协方差矩阵的迹，用于把特征值换算成方差解释率
+        double totalVariance = 0.0;
+        for (int i = 0; i < m; i++) totalVariance += cov[i][i];
+
         for (int comp = 0; comp < k; comp++) {
             double[] v = new double[m];
-            // init random
-            for (int i = 0; i < m; i++) v[i] = Math.random() - 0.5;
+            // 确定性初始化：避免每次调用特征向量符号/数值随机跳动
+            for (int i = 0; i < m; i++) v[i] = 1.0 + 0.1 * (i + 1);
+            double initNorm = 0.0; for (int i = 0; i < m; i++) initNorm += v[i] * v[i];
+            initNorm = Math.sqrt(Math.max(1e-12, initNorm));
+            for (int i = 0; i < m; i++) v[i] /= initNorm;
             // power iteration
-            for (int it = 0; it < 60; it++) {
+            for (int it = 0; it < 200; it++) {
                 double[] next = new double[m];
                 for (int i = 0; i < m; i++) {
                     double s = 0.0;
@@ -2897,6 +2939,10 @@ public class TrainingSimulationService {
                 norm = Math.sqrt(Math.max(1e-12, norm));
                 for (int i = 0; i < m; i++) v[i] = next[i] / norm;
             }
+            // 符号归一：让绝对值最大的载荷为正，保证载荷矩阵可读且稳定
+            int maxIdx = 0;
+            for (int i = 1; i < m; i++) if (Math.abs(v[i]) > Math.abs(v[maxIdx])) maxIdx = i;
+            if (v[maxIdx] < 0) for (int i = 0; i < m; i++) v[i] = -v[i];
             // eigenvalue
             double[] Cv = new double[m];
             for (int i = 0; i < m; i++) {
@@ -2925,6 +2971,8 @@ public class TrainingSimulationService {
         res.components = components;
         res.transformed = transformed;
         res.eigenvalues = eigenvalues;
+        res.mean = mean;
+        res.totalVariance = totalVariance;
         return res;
     }
 
