@@ -13,17 +13,8 @@ import { ApiService } from '../services/api.service';
 import { ExperimentContextService } from '../services/experiment-context.service';
 import { environment } from '../../environments/environment';
 import { TrainingLogEntry } from '../components/training-log/training-log.component';
-import { describePcaComponents, PcaComponentLabel } from '../utils/pca-labels';
-
-/** PCA 结果摘要，供右侧信息面板展示方差解释率与载荷矩阵 */
-export interface PcaSummary {
-  k: number;
-  explained: number[];
-  cumulative: number[];
-  loadings: { name: string; values: number[] }[];
-  /** 每个主成分的含义标签（主导特征 + 轴类型） */
-  labels: PcaComponentLabel[];
-}
+import { describePcaComponents } from '../utils/pca-labels';
+import { PcaSummary } from '../models/pca.model';
 
 @Component({
   selector: 'app-experiment',

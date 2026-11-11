@@ -11,6 +11,7 @@ import {
 } from '@angular/core';
 import * as echarts from 'echarts';
 import { EvaluationPanelState, MetricCard } from '../../models/learning-guide.model';
+import { PcaSummary } from '../../models/pca.model';
 
 interface MetricViewModel {
   label: string;
@@ -27,6 +28,8 @@ interface MetricViewModel {
 })
 export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDestroy {
   @Input() evaluation: EvaluationPanelState | null = null;
+  /** PCA 结果：非空时本面板改为展示主成分分析，不再渲染指标卡与训练轨迹 */
+  @Input() pca: PcaSummary | null = null;
 
   @ViewChild('chartHost')
   set chartHostRef(host: ElementRef<HTMLDivElement> | undefined) {
@@ -47,6 +50,14 @@ export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDes
   }
 
   ngOnChanges(changes: SimpleChanges): void {
+    if (changes['pca']) {
+      if (this.pca) {
+        // 切到 PCA 模式：训练轨迹不存在了，销毁 ECharts 实例
+        this.chart?.dispose();
+        this.chart = null;
+      }
+      this.scheduleRenderChart();
+    }
     if (changes['evaluation']) {
       this.scheduleRenderChart();
     }
@@ -66,16 +77,13 @@ export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDes
 
   get metricCards(): MetricViewModel[] {
     const cards = this.evaluation?.cards || [];
-    return cards.map((card, index) => {
-      const positive = this.isPositive(card);
-      return {
-        label: this.normalizeLabel(card.label),
-        value: this.formatCardValue(card),
-        color: this.getToneColor(card.tone),
-        delta: this.getDelta(card, index),
-        positive
-      };
-    });
+    return cards.map((card) => ({
+      label: this.normalizeLabel(card.label),
+      value: this.formatCardValue(card),
+      color: this.getToneColor(card.tone),
+      delta: this.getDelta(card),
+      positive: this.isPositive(card)
+    }));
   }
 
   normalizeLabel(label: string): string {
@@ -104,17 +112,21 @@ export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDes
     return tones[tone] || '#378ADD';
   }
 
-  private getDelta(card: MetricCard, index: number): string {
-    if (card.trend) {
-      return `${card.trend} vs 上次运行`;
+  /** 只显示真实的上一步差值；没有上一步（只有基线点）时为空 */
+  private getDelta(card: MetricCard): string {
+    if (card.delta === undefined || card.delta === null || Number.isNaN(card.delta)) {
+      return '';
     }
-    const defaults = ['+0.03 vs 上次运行', '+2.1% vs 上次运行', '-1.2 vs 上次运行', '+2% vs 上次运行'];
-    return defaults[index % defaults.length];
+    const sign = card.delta > 0 ? '+' : '';
+    const decimals = Math.abs(card.delta) < 0.01 ? 4 : 2;
+    return `${sign}${card.delta.toFixed(decimals)} 较上一步`;
   }
 
   private isPositive(card: MetricCard): boolean {
-    const label = this.normalizeLabel(card.label).toLowerCase();
-    return !(label.includes('mae') || label.includes('mse'));
+    if (card.delta === undefined || card.delta === null) {
+      return true;
+    }
+    return card.lowerIsBetter ? card.delta <= 0 : card.delta >= 0;
   }
 
   private scheduleRenderChart(): void {
@@ -128,6 +140,10 @@ export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDes
   }
 
   private renderChart(): void {
+    // PCA 模式只展示主成分分析，没有训练轨迹
+    if (this.pca) {
+      return;
+    }
     if (!this.chartHost?.nativeElement || !this.evaluation?.chart?.length) {
       return;
     }
@@ -137,14 +153,14 @@ export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDes
     }
 
     const chartData = this.evaluation.chart;
-    const labels = chartData.map((point) => `S${point.step}`);
     const lossLabel = this.normalizeLabel(this.evaluation.lossLabel);
     const scoreLabel = this.normalizeLabel(this.evaluation.scoreLabel);
+    const totalSteps = this.evaluation.totalSteps;
 
     this.chart.setOption({
       animation: true,
-      animationDuration: 800,
-      animationDurationUpdate: 650,
+      animationDuration: 500,
+      animationDurationUpdate: 220,
       animationEasing: 'cubicOut',
       animationEasingUpdate: 'cubicOut',
       grid: {
@@ -159,14 +175,21 @@ export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDes
         borderColor: 'rgba(255,255,255,0.08)',
         textStyle: {
           color: '#E2E8F0'
+        },
+        formatter: (params: any) => {
+          const items = Array.isArray(params) ? params : [params];
+          const step = items[0]?.value?.[0] ?? '';
+          const rows = items.map((item: any) => `${item.marker}${item.seriesName}: ${item.value?.[1]}`);
+          return `步骤 ${step}<br/>${rows.join('<br/>')}`;
         }
       },
       xAxis: {
-        type: 'category',
-        data: labels,
-        boundaryGap: false,
+        type: 'value',
+        min: 0,
+        max: totalSteps && totalSteps > 0 ? totalSteps : undefined,
+        minInterval: 1,
         axisLine: { lineStyle: { color: 'rgba(255,255,255,0.12)' } },
-        axisLabel: { color: '#94A3B8', fontSize: 10 },
+        axisLabel: { color: '#94A3B8', fontSize: 10, formatter: (value: number) => `${Math.round(value)}` },
         splitLine: { show: false }
       },
       yAxis: [
@@ -222,7 +245,7 @@ export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDes
               { offset: 1, color: 'rgba(56,189,248,0)' }
             ])
           },
-          data: chartData.map((point) => point.loss)
+          data: chartData.map((point) => [point.step, point.loss])
         },
         {
           name: scoreLabel,
@@ -256,7 +279,7 @@ export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDes
               { offset: 1, color: 'rgba(192,132,252,0)' }
             ])
           },
-          data: chartData.map((point) => point.score)
+          data: chartData.map((point) => [point.step, point.score])
         }
       ]
     });

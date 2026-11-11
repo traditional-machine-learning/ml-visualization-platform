@@ -6,6 +6,7 @@ import {
   ExperimentSimulationState,
   GuidedExperimentCase,
   LoadedExperimentConfig,
+  MetricCard,
   ModelExplanationState,
   SimulationContext,
   TrainingPoint
@@ -314,21 +315,37 @@ export class LearningGuideDataService {
     const progress = totalSteps
       ? context.trainingState.currentStep / totalSteps
       : 0;
-    const chart = this.buildTrainingCurve(progress, algorithm.type, totalSteps);
+
+    // 真实逐步指标由后端累积在 trainingState.metrics 里；演示模式（没有 session）才退回合成曲线
+    const metrics = context.trainingState.metrics;
+    const realPoints = metrics?.points ?? [];
+    const chart: TrainingPoint[] = realPoints.length
+      ? realPoints.map((point) => ({ step: point.step, loss: point.loss, score: point.score }))
+      : this.buildTrainingCurve(progress, algorithm.type, totalSteps);
+    const labels = {
+      lossLabel: metrics?.lossLabel || (algorithm.type === 'clustering' ? '惯性' : algorithm.type === 'regression' ? 'MSE' : '损失'),
+      scoreLabel: metrics?.scoreLabel || (algorithm.type === 'clustering' ? '轮廓系数' : algorithm.type === 'regression' ? 'R²' : '准确率')
+    };
 
     if (algorithm.name === 'decision_tree') {
       return {
-        evaluation: this.buildClassificationEvaluation(chart, progress, '当前深度下的树准确率'),
+        evaluation: this.buildEvaluation(chart, context.trainingState, 'classification', '当前深度下的树准确率', labels, totalSteps),
         explanation: this.buildDecisionTreeExplanation(progress, context.parameters),
         statusText: progress >= 1 ? '树结构已验证，可以查看解释。' : '树正在逐层分裂生长。'
       };
     }
 
-    if (algorithm.name === 'linear_regression' || algorithm.name === 'logistic_regression') {
+    if (algorithm.name === 'linear_regression') {
       return {
-        evaluation: algorithm.name === 'linear_regression'
-          ? this.buildRegressionEvaluation(chart, progress)
-          : this.buildClassificationEvaluation(chart, progress, '边界质量和类别置信度'),
+        evaluation: this.buildEvaluation(chart, context.trainingState, 'regression', '跟踪优化过程中的拟合质量和误差收缩。', labels, totalSteps),
+        explanation: this.buildWeightExplanation(algorithm.name, progress),
+        statusText: progress >= 1 ? '权重已稳定，可以进行解释。' : '权重正在每次优化步骤中更新。'
+      };
+    }
+
+    if (algorithm.name === 'logistic_regression') {
+      return {
+        evaluation: this.buildEvaluation(chart, context.trainingState, 'classification', '边界质量和类别置信度', labels, totalSteps),
         explanation: this.buildWeightExplanation(algorithm.name, progress),
         statusText: progress >= 1 ? '权重已稳定，可以进行解释。' : '权重正在每次优化步骤中更新。'
       };
@@ -336,14 +353,14 @@ export class LearningGuideDataService {
 
     if (algorithm.name === 'kmeans') {
       return {
-        evaluation: this.buildClusteringEvaluation(chart, progress, Number(context.parameters['k'] || 3)),
+        evaluation: this.buildEvaluation(chart, context.trainingState, 'clustering', `检查K = ${Number(context.parameters['k'] || 3)}的聚类紧凑性。`, labels, totalSteps),
         explanation: this.buildKMeansExplanation(progress, Number(context.parameters['k'] || 3)),
         statusText: progress >= 1 ? '聚类中心已稳定。' : '聚类中心仍在向密集区域移动。'
       };
     }
 
     return {
-      evaluation: this.buildClassificationEvaluation(chart, progress, '当前参数下的边界质量'),
+      evaluation: this.buildEvaluation(chart, context.trainingState, 'classification', '当前参数下的边界质量', labels, totalSteps),
       explanation: {
         mode: 'summary',
         title: '支持向量摘要',
@@ -464,52 +481,62 @@ export class LearningGuideDataService {
     };
   }
 
-  private buildClassificationEvaluation(chart: TrainingPoint[], progress: number, subtitle: string): EvaluationPanelState {
+  /**
+   * 评估面板状态：只使用后端真实算出的指标（准确率/R²/轮廓系数 + 对应损失），
+   * 训练轨迹也用后端的逐步历史；没有历史时（演示模式）才由 buildTrainingCurve 兜底。
+   */
+  private buildEvaluation(
+    chart: TrainingPoint[],
+    state: TrainingState,
+    kind: 'classification' | 'regression' | 'clustering',
+    subtitle: string,
+    labels: { lossLabel: string; scoreLabel: string },
+    totalSteps: number
+  ): EvaluationPanelState {
     return {
-      title: '评估指标',
+      title: kind === 'regression' ? '回归质量' : kind === 'clustering' ? '聚类指标' : '评估指标',
       subtitle,
-      scoreLabel: '准确率',
-      lossLabel: '损失',
-      cards: [
-        { label: '准确率', value: 0.74 + progress * 0.19, suffix: '%', tone: 'cyan', icon: 'track_changes' },
-        { label: '精确率', value: 0.7 + progress * 0.2, suffix: '%', tone: 'purple', icon: 'check_circle' },
-        { label: '召回率', value: 0.68 + progress * 0.22, suffix: '%', tone: 'green', icon: 'radar' },
-        { label: 'F1值', value: 0.69 + progress * 0.21, suffix: '%', tone: 'amber', icon: 'insights' }
-      ],
-      chart
+      scoreLabel: labels.scoreLabel,
+      lossLabel: labels.lossLabel,
+      cards: this.buildMetricCards(kind, state, chart, labels),
+      chart,
+      totalSteps
     };
   }
 
-  private buildRegressionEvaluation(chart: TrainingPoint[], progress: number): EvaluationPanelState {
-    return {
-      title: '回归质量',
-      subtitle: '跟踪优化过程中的拟合质量和误差收缩。',
-      scoreLabel: 'R²',
-      lossLabel: 'MSE',
-      cards: [
-        { label: 'R²', value: 0.45 + progress * 0.42, suffix: '%', display: 'ratioPercent', tone: 'cyan', icon: 'show_chart', trend: '+0.03' },
-        { label: 'MAE', value: 12.6 - progress * 4.2, display: 'number', tone: 'purple', icon: 'straighten', trend: '-1.2' },
-        { label: 'MSE', value: 28.4 - progress * 11.8, display: 'number', tone: 'green', icon: 'timeline', trend: '-3.1' },
-        { label: '损失下降', value: 18 + progress * 52, suffix: '%', display: 'percent', tone: 'amber', icon: 'trending_down', trend: '+2%' }
-      ],
-      chart
-    };
-  }
+  private buildMetricCards(
+    kind: 'classification' | 'regression' | 'clustering',
+    state: TrainingState,
+    chart: TrainingPoint[],
+    labels: { lossLabel: string; scoreLabel: string }
+  ): MetricCard[] {
+    const last = chart[chart.length - 1];
+    const previous = chart[chart.length - 2];
+    const deltaOf = (pick: (point: TrainingPoint) => number): number | undefined =>
+      last && previous ? Number((pick(last) - pick(previous)).toFixed(4)) : undefined;
 
-  private buildClusteringEvaluation(chart: TrainingPoint[], progress: number, k: number): EvaluationPanelState {
-    return {
-      title: '聚类指标',
-      subtitle: `检查K = ${k}的聚类紧凑性。`,
-      scoreLabel: '轮廓系数',
-      lossLabel: '惯性',
-      cards: [
-        { label: '轮廓系数', value: 0.42 + progress * 0.35, suffix: '%', tone: 'cyan', icon: 'bubble_chart' },
-        { label: '惯性下降', value: 18 + progress * 58, suffix: '%', tone: 'purple', icon: 'compress' },
-        { label: '聚类数量', value: k, tone: 'green', icon: 'filter_3' },
-        { label: '稳定性', value: 0.5 + progress * 0.34, suffix: '%', tone: 'amber', icon: 'auto_awesome' }
-      ],
-      chart
-    };
+    const scoreIcon = kind === 'clustering' ? 'bubble_chart' : kind === 'regression' ? 'show_chart' : 'track_changes';
+    return [
+      {
+        label: labels.scoreLabel,
+        value: state.accuracy,
+        suffix: '%',
+        display: 'ratioPercent',
+        delta: deltaOf((point) => point.score),
+        lowerIsBetter: false,
+        tone: 'cyan',
+        icon: scoreIcon
+      },
+      {
+        label: labels.lossLabel,
+        value: state.loss,
+        display: 'number',
+        delta: deltaOf((point) => point.loss),
+        lowerIsBetter: true,
+        tone: 'purple',
+        icon: 'timeline'
+      }
+    ];
   }
 
   private buildTrainingCurve(progress: number, type: string, totalSteps: number = 8): TrainingPoint[] {

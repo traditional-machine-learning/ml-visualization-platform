@@ -43,77 +43,7 @@
         [trainingState]="trainingState">
       </app-visualization-canvas>
 
-      <mat-card class="pca-card" *ngIf="pcaSummary as pca">
-        <mat-card-header>
-          <mat-card-title>
-            <span class="pca-title">主成分分析</span>
-            <span class="pca-badge">{{ pca.k }} 个主成分</span>
-          </mat-card-title>
-        </mat-card-header>
-        <mat-card-content>
-          <div class="pca-section-label">方差解释率</div>
-          <div class="pca-variance">
-            <div class="pca-variance-row" *ngFor="let ratio of pca.explained; let i = index">
-              <span class="pca-pc">PC{{ i + 1 }}</span>
-              <div class="pca-bar">
-                <span class="pca-bar-fill" [style.width.%]="ratio * 100"></span>
-              </div>
-              <span class="pca-value">{{ ratio * 100 | number:'1.1-1' }}%</span>
-            </div>
-          </div>
-
-          <div class="pca-section-label" *ngIf="pca.labels.length">主成分含义</div>
-          <div class="pca-meanings" *ngIf="pca.labels.length">
-            <div class="pca-meaning" *ngFor="let label of pca.labels">
-              <div class="pca-meaning-head">
-                <span class="pca-pc">PC{{ label.index + 1 }}</span>
-                <span class="pca-tag">{{ label.shortLabel }}</span>
-                <span class="pca-meaning-ratio" *ngIf="label.ratio !== null">
-                  {{ label.ratio * 100 | number:'1.1-1' }}%
-                </span>
-              </div>
-              <p class="pca-meaning-desc">{{ label.description }}</p>
-              <div class="pca-chips" *ngIf="label.dominant.length">
-                <span class="pca-chip" *ngFor="let f of label.dominant"
-                      [class.pca-chip-neg]="f.loading < 0">
-                  {{ f.name }}
-                  <b>{{ f.loading >= 0 ? '+' : '' }}{{ f.loading | number:'1.2-2' }}</b>
-                </span>
-              </div>
-            </div>
-          </div>
-          <div class="pca-total">
-            累计解释率
-            <strong>{{ (pca.cumulative[pca.cumulative.length - 1] || 0) * 100 | number:'1.1-1' }}%</strong>
-          </div>
-
-          <div class="pca-section-label" *ngIf="pca.loadings.length">载荷矩阵</div>
-          <div class="pca-table-wrap" *ngIf="pca.loadings.length">
-            <table class="pca-loadings">
-              <thead>
-                <tr>
-                  <th>原始维度</th>
-                  <th *ngFor="let ratio of pca.explained; let i = index">PC{{ i + 1 }}</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr *ngFor="let row of pca.loadings">
-                  <td>{{ row.name }}</td>
-                  <td *ngFor="let value of row.values"
-                      [class.pca-strong]="value >= 0.5 || value <= -0.5">
-                    {{ value | number:'1.2-3' }}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <p class="pca-hint">
-            载荷绝对值越大，该维度对这个主成分的贡献越大。主成分数设为 1 时沿 PC1 单轴展示，设为 3 时可在画布右上角切换到 3D 视图；换数据集或重新训练会自动回到 2D。
-          </p>
-        </mat-card-content>
-      </mat-card>
-
-      <app-evaluation-panel [evaluation]="evaluationState"></app-evaluation-panel>
+      <app-evaluation-panel [evaluation]="evaluationState" [pca]="pcaSummary"></app-evaluation-panel>
     </div>
 
     <div class="right-panel">
