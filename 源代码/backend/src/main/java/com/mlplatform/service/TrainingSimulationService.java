@@ -22,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.TreeMap;
 
 @Service
 public class TrainingSimulationService {
@@ -70,8 +71,12 @@ public class TrainingSimulationService {
             totalSteps = Math.max(1, countSplits(initialModel.getTree()));
             session.setTotalSteps(totalSteps);
         }
-        TrainingSimulationResponse initial = buildResponse(session, algorithm, dataset, initialModel, null);
-        session.setMetrics(toJson(initial.getMetrics()));
+        // 训练轨迹从第 0 步的基线点开始累积
+        StepResult initialResult = evaluateCurrentState(algorithm, dataset, session.getParameters(), initialModel);
+        TrainingSimulationResponse.Metrics history = newMetricsHistory(algorithm, initialResult);
+        upsertMetricPoint(history, 0, initialResult);
+        TrainingSimulationResponse initial = buildResponse(session, algorithm, dataset, initialModel, initialResult, history);
+        session.setMetrics(toJson(history));
         session.setModelData(toJson(initial.getModelData()));
         trainingSessionRepository.insert(session);
 
@@ -101,8 +106,11 @@ public class TrainingSimulationService {
         session.setCurrentStep(nextStep);
         session.setStatus(nextStep >= totalSteps ? "completed" : "training");
 
-        TrainingSimulationResponse response = buildResponse(session, algorithm, dataset, stepResult.modelData, stepResult);
-        session.setMetrics(toJson(response.getMetrics()));
+        // 真实逐步轨迹：每一步追加一个点（同一步重复请求则覆盖）
+        TrainingSimulationResponse.Metrics history = readMetrics(session);
+        upsertMetricPoint(history, nextStep, stepResult);
+        TrainingSimulationResponse response = buildResponse(session, algorithm, dataset, stepResult.modelData, stepResult, history);
+        session.setMetrics(toJson(history));
         session.setModelData(toJson(response.getModelData()));
         trainingSessionRepository.update(session);
 
@@ -124,8 +132,11 @@ public class TrainingSimulationService {
 
         TrainingSimulationResponse.ModelData modelData = readOrInitializeModelData(session, algorithm, dataset);
         StepResult current = evaluateCurrentState(algorithm, dataset, session.getParameters(), modelData);
-        TrainingSimulationResponse response = buildResponse(session, algorithm, dataset, modelData, current);
-        session.setMetrics(toJson(response.getMetrics()));
+        // 暂停不是训练步：只把当前步的点对齐到最新评估，不新增点数
+        TrainingSimulationResponse.Metrics history = readMetrics(session);
+        upsertMetricPoint(history, currentStep, current);
+        TrainingSimulationResponse response = buildResponse(session, algorithm, dataset, modelData, current, history);
+        session.setMetrics(toJson(history));
         session.setModelData(toJson(response.getModelData()));
         trainingSessionRepository.update(session);
 
@@ -145,13 +156,16 @@ public class TrainingSimulationService {
 
     public TrainingSimulationResponse.Metrics getMetrics(Long sessionId) {
         TrainingSession session = requireSession(sessionId);
-        if (session.getMetrics() != null) {
-            return fromJson(session.getMetrics(), TrainingSimulationResponse.Metrics.class);
+        TrainingSimulationResponse.Metrics metrics = readMetrics(session);
+        if (metrics.getPoints().isEmpty()) {
+            // 极老的会话没有历史：现场评估一次，只给当前步一个点
+            Algorithm algorithm = requireAlgorithm(session.getAlgorithmId());
+            Dataset dataset = requireDataset(session.getDatasetId());
+            StepResult current = evaluateCurrentState(algorithm, dataset, session.getParameters(), getModelData(sessionId));
+            metrics = newMetricsHistory(algorithm, current);
+            upsertMetricPoint(metrics, session.getCurrentStep() == null ? 0 : session.getCurrentStep(), current);
         }
-        Algorithm algorithm = requireAlgorithm(session.getAlgorithmId());
-        Dataset dataset = requireDataset(session.getDatasetId());
-        StepResult current = evaluateCurrentState(algorithm, dataset, session.getParameters(), getModelData(sessionId));
-        return buildMetrics(algorithm, session.getCurrentStep(), session.getTotalSteps(), current);
+        return metrics;
     }
 
     /**
@@ -584,7 +598,8 @@ public class TrainingSimulationService {
             Algorithm algorithm,
             Dataset dataset,
             TrainingSimulationResponse.ModelData modelData,
-            StepResult stepResult) {
+            StepResult stepResult,
+            TrainingSimulationResponse.Metrics history) {
         StepResult current = stepResult == null
                 ? evaluateCurrentState(algorithm, dataset, session.getParameters(), modelData)
                 : stepResult;
@@ -603,39 +618,56 @@ public class TrainingSimulationService {
         response.setLoss(current.loss);
         response.setAccuracy(current.score);
         response.setScoreLabel(current.scoreLabel);
-        response.setMetrics(buildMetrics(algorithm, response.getCurrentStep(), totalSteps, current));
+        response.setMetrics(history);
         response.setModelData(current.modelData);
         return response;
     }
 
-    private TrainingSimulationResponse.Metrics buildMetrics(
+    /** 训练历史：点就是"已经发生过的每一步"，标签取自算法与当前评估 */
+    private TrainingSimulationResponse.Metrics newMetricsHistory(
             Algorithm algorithm,
-            Integer currentStep,
-            int totalSteps,
             StepResult current) {
-        int safeCurrent = currentStep == null ? 0 : currentStep;
-        int safeTotal = totalSteps;
-        List<TrainingSimulationResponse.MetricPoint> points = new ArrayList<>();
-
-        for (int step = 1; step <= safeTotal; step++) {
-            double visibleProgress = safeTotal == 0 ? 0.0 : (double) Math.min(step, safeCurrent) / safeTotal;
-            TrainingSimulationResponse.MetricPoint point = new TrainingSimulationResponse.MetricPoint();
-            point.setStep(step);
-            if (step <= safeCurrent || safeCurrent == 0) {
-                point.setLoss(step == safeCurrent ? current.loss : interpolateLoss(current.loss, visibleProgress));
-                point.setScore(step == safeCurrent ? current.score : interpolateScore(current.score, visibleProgress));
-            } else {
-                point.setLoss(current.loss);
-                point.setScore(current.score);
-            }
-            points.add(point);
-        }
-
         TrainingSimulationResponse.Metrics metrics = new TrainingSimulationResponse.Metrics();
-        metrics.setPoints(points);
+        metrics.setPoints(new ArrayList<>());
         metrics.setLossLabel(getLossLabel(algorithm));
-        metrics.setScoreLabel(current.scoreLabel);
+        metrics.setScoreLabel(current != null ? current.scoreLabel : "Accuracy");
         return metrics;
+    }
+
+    /** 从会话里读出历史；旧格式里"未来步"的点会被裁掉，避免画出不存在的轨迹 */
+    private TrainingSimulationResponse.Metrics readMetrics(TrainingSession session) {
+        TrainingSimulationResponse.Metrics metrics = session.getMetrics() == null || session.getMetrics().isBlank()
+                ? null
+                : fromJson(session.getMetrics(), TrainingSimulationResponse.Metrics.class);
+        if (metrics == null) {
+            metrics = new TrainingSimulationResponse.Metrics();
+        }
+        if (metrics.getPoints() == null) {
+            metrics.setPoints(new ArrayList<>());
+        }
+        int currentStep = session.getCurrentStep() == null ? 0 : session.getCurrentStep();
+        metrics.getPoints().removeIf(point -> point.getStep() != null && point.getStep() > currentStep);
+        return metrics;
+    }
+
+    /** 写入/覆盖某一步的指标点；按 step 排序，重复请求同一步不会产生重复点 */
+    private void upsertMetricPoint(
+            TrainingSimulationResponse.Metrics metrics,
+            int step,
+            StepResult result) {
+        Map<Integer, TrainingSimulationResponse.MetricPoint> byStep = new TreeMap<>();
+        for (TrainingSimulationResponse.MetricPoint point : metrics.getPoints()) {
+            if (point.getStep() != null) {
+                byStep.put(point.getStep(), point);
+            }
+        }
+        TrainingSimulationResponse.MetricPoint point = new TrainingSimulationResponse.MetricPoint();
+        point.setStep(step);
+        point.setLoss(round(result.loss));
+        point.setScore(round(result.score));
+        byStep.put(step, point);
+        metrics.setPoints(new ArrayList<>(byStep.values()));
+        metrics.setScoreLabel(result.scoreLabel);
     }
 
     private TrainingSimulationResponse.ModelData initializeModelData(Algorithm algorithm, Dataset dataset, String parameters) {
@@ -2795,14 +2827,6 @@ public class TrainingSimulationService {
         } catch (Exception e) {
             throw new IllegalArgumentException("Failed to parse training state");
         }
-    }
-
-    private double interpolateLoss(double currentLoss, double progress) {
-        return round(Math.max(currentLoss, currentLoss + (1.0 - progress) * 0.72));
-    }
-
-    private double interpolateScore(double currentScore, double progress) {
-        return round(Math.min(currentScore, currentScore * (0.38 + progress * 0.62)));
     }
 
     private String getLossLabel(Algorithm algorithm) {
