@@ -319,17 +319,24 @@ export class LearningGuideDataService {
     // 真实逐步指标由后端累积在 trainingState.metrics 里；演示模式（没有 session）才退回合成曲线
     const metrics = context.trainingState.metrics;
     const realPoints = metrics?.points ?? [];
+    // 训练还没开始：轨迹留空、卡片也不显示数字
+    const started = context.trainingState.status !== 'idle'
+      || !!context.trainingState.sessionId
+      || context.trainingState.currentStep > 0;
     const chart: TrainingPoint[] = realPoints.length
       ? realPoints.map((point) => ({ step: point.step, loss: point.loss, score: point.score }))
-      : this.buildTrainingCurve(progress, algorithm.type, totalSteps);
+      : started
+        ? this.buildTrainingCurve(progress, algorithm.type, totalSteps)
+        : [];
     const labels = {
-      lossLabel: metrics?.lossLabel || (algorithm.type === 'clustering' ? '惯性' : algorithm.type === 'regression' ? 'MSE' : '损失'),
-      scoreLabel: metrics?.scoreLabel || (algorithm.type === 'clustering' ? '轮廓系数' : algorithm.type === 'regression' ? 'R²' : '准确率')
+      // 未开始时用与后端一致的英文标签，避免训练开始前后标签来回切换
+      lossLabel: metrics?.lossLabel || (algorithm.type === 'clustering' ? 'Inertia' : algorithm.type === 'regression' ? 'MSE' : 'Loss'),
+      scoreLabel: metrics?.scoreLabel || (algorithm.type === 'clustering' ? 'Silhouette' : algorithm.type === 'regression' ? 'R2' : 'Accuracy')
     };
 
     if (algorithm.name === 'decision_tree') {
       return {
-        evaluation: this.buildEvaluation(chart, context.trainingState, 'classification', '当前深度下的树准确率', labels, totalSteps),
+        evaluation: this.buildEvaluation(chart, context.trainingState, 'classification', '当前深度下的树准确率', labels, totalSteps, started),
         explanation: this.buildDecisionTreeExplanation(progress, context.parameters),
         statusText: progress >= 1 ? '树结构已验证，可以查看解释。' : '树正在逐层分裂生长。'
       };
@@ -337,7 +344,7 @@ export class LearningGuideDataService {
 
     if (algorithm.name === 'linear_regression') {
       return {
-        evaluation: this.buildEvaluation(chart, context.trainingState, 'regression', '跟踪优化过程中的拟合质量和误差收缩。', labels, totalSteps),
+        evaluation: this.buildEvaluation(chart, context.trainingState, 'regression', '跟踪优化过程中的拟合质量和误差收缩。', labels, totalSteps, started),
         explanation: this.buildWeightExplanation(algorithm.name, progress),
         statusText: progress >= 1 ? '权重已稳定，可以进行解释。' : '权重正在每次优化步骤中更新。'
       };
@@ -345,7 +352,7 @@ export class LearningGuideDataService {
 
     if (algorithm.name === 'logistic_regression') {
       return {
-        evaluation: this.buildEvaluation(chart, context.trainingState, 'classification', '边界质量和类别置信度', labels, totalSteps),
+        evaluation: this.buildEvaluation(chart, context.trainingState, 'classification', '边界质量和类别置信度', labels, totalSteps, started),
         explanation: this.buildWeightExplanation(algorithm.name, progress),
         statusText: progress >= 1 ? '权重已稳定，可以进行解释。' : '权重正在每次优化步骤中更新。'
       };
@@ -353,14 +360,39 @@ export class LearningGuideDataService {
 
     if (algorithm.name === 'kmeans') {
       return {
-        evaluation: this.buildEvaluation(chart, context.trainingState, 'clustering', `检查K = ${Number(context.parameters['k'] || 3)}的聚类紧凑性。`, labels, totalSteps),
+        evaluation: this.buildEvaluation(chart, context.trainingState, 'clustering', `检查K = ${Number(context.parameters['k'] || 3)}的聚类紧凑性。`, labels, totalSteps, started),
         explanation: this.buildKMeansExplanation(progress, Number(context.parameters['k'] || 3)),
         statusText: progress >= 1 ? '聚类中心已稳定。' : '聚类中心仍在向密集区域移动。'
       };
     }
 
+    if (algorithm.name === 'pca') {
+      // PCA 结果由 pcaSummary 单独渲染到同一个面板里；这里只给空的评估状态与说明
+      return {
+        evaluation: {
+          title: '主成分分析',
+          subtitle: '计算完成后显示方差解释率、主成分含义与载荷矩阵。',
+          cards: [],
+          chart: [],
+          scoreLabel: 'ExplainedVar',
+          lossLabel: ''
+        },
+        explanation: {
+          mode: 'summary',
+          title: '主成分摘要',
+          description: 'PCA 把原始维度线性组合成互不相关的主成分，并按解释方差从大到小排列。',
+          notes: [
+            '方差解释率越高，该主成分保留的原始信息越多。',
+            '载荷矩阵表示原始维度对每个主成分的贡献。',
+            '主成分数设为 1 或 3 时，画布会切换单轴 / 3D 展示。'
+          ]
+        },
+        statusText: '点击开始训练，计算主成分并显示解释方差。'
+      };
+    }
+
     return {
-      evaluation: this.buildEvaluation(chart, context.trainingState, 'classification', '当前参数下的边界质量', labels, totalSteps),
+      evaluation: this.buildEvaluation(chart, context.trainingState, 'classification', '当前参数下的边界质量', labels, totalSteps, started),
       explanation: {
         mode: 'summary',
         title: '支持向量摘要',
@@ -491,14 +523,15 @@ export class LearningGuideDataService {
     kind: 'classification' | 'regression' | 'clustering',
     subtitle: string,
     labels: { lossLabel: string; scoreLabel: string },
-    totalSteps: number
+    totalSteps: number,
+    started: boolean
   ): EvaluationPanelState {
     return {
       title: kind === 'regression' ? '回归质量' : kind === 'clustering' ? '聚类指标' : '评估指标',
       subtitle,
       scoreLabel: labels.scoreLabel,
       lossLabel: labels.lossLabel,
-      cards: this.buildMetricCards(kind, state, chart, labels),
+      cards: this.buildMetricCards(kind, state, chart, labels, started),
       chart,
       totalSteps
     };
@@ -508,18 +541,19 @@ export class LearningGuideDataService {
     kind: 'classification' | 'regression' | 'clustering',
     state: TrainingState,
     chart: TrainingPoint[],
-    labels: { lossLabel: string; scoreLabel: string }
+    labels: { lossLabel: string; scoreLabel: string },
+    started: boolean
   ): MetricCard[] {
     const last = chart[chart.length - 1];
     const previous = chart[chart.length - 2];
     const deltaOf = (pick: (point: TrainingPoint) => number): number | undefined =>
-      last && previous ? Number((pick(last) - pick(previous)).toFixed(4)) : undefined;
+      started && last && previous ? Number((pick(last) - pick(previous)).toFixed(4)) : undefined;
 
     const scoreIcon = kind === 'clustering' ? 'bubble_chart' : kind === 'regression' ? 'show_chart' : 'track_changes';
     return [
       {
         label: labels.scoreLabel,
-        value: state.accuracy,
+        value: started ? state.accuracy : undefined,
         suffix: '%',
         display: 'ratioPercent',
         delta: deltaOf((point) => point.score),
@@ -529,7 +563,7 @@ export class LearningGuideDataService {
       },
       {
         label: labels.lossLabel,
-        value: state.loss,
+        value: started ? state.loss : undefined,
         display: 'number',
         delta: deltaOf((point) => point.loss),
         lowerIsBetter: true,

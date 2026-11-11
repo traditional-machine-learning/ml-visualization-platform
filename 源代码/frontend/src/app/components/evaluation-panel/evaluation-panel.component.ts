@@ -92,6 +92,10 @@ export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDes
   }
 
   private formatCardValue(card: MetricCard): string {
+    // 训练还没开始：卡片只显示标签，不出现任何数字
+    if (card.value === undefined || card.value === null || Number.isNaN(card.value)) {
+      return '';
+    }
     const mode = card.display || (card.suffix === '%' ? (card.value <= 1.2 ? 'ratioPercent' : 'percent') : 'number');
     if (mode === 'ratioPercent') {
       return `${(card.value * 100).toFixed(1)}${card.suffix || ''}`;
@@ -144,7 +148,7 @@ export class EvaluationPanelComponent implements AfterViewInit, OnChanges, OnDes
     if (this.pca) {
       return;
     }
-    if (!this.chartHost?.nativeElement || !this.evaluation?.chart?.length) {
+    if (!this.chartHost?.nativeElement || !this.evaluation) {
       return;
     }
 

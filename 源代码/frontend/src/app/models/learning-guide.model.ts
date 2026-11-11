@@ -2,7 +2,8 @@ import { Algorithm, Dataset, TrainingState } from './algorithm.model';
 
 export interface MetricCard {
   label: string;
-  value: number;
+  /** 训练尚未开始时为 undefined：卡片只显示标签，不显示任何数字 */
+  value?: number;
   suffix?: string;
   display?: 'ratioPercent' | 'percent' | 'number';
   /** 与上一步相比的真实变化量，正负号表示增减；没有上一步时为 undefined（不显示） */
