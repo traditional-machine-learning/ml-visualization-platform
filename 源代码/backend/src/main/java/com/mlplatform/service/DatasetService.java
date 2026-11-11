@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Service
@@ -25,30 +26,43 @@ public class DatasetService {
 
     public List<DatasetDTO> getAllDatasets() {
         return datasetRepository.findAll().stream()
-                .map(this::convertToDTO)
+                .map(dataset -> convertToDTO(dataset, false))
                 .collect(Collectors.toList());
     }
 
+    /** 详情接口：额外返回全维度元数据与每行的原始维度值，供前端自由选择坐标轴 */
     public DatasetDTO getDatasetById(Long id) {
         Dataset dataset = datasetRepository.findById(id);
         if (dataset == null) {
             throw new IllegalArgumentException("Dataset not found with id: " + id);
         }
-        return convertToDTO(dataset);
+        return convertToDTO(dataset, true);
     }
 
     public List<DatasetDTO> getDatasetsByCategory(String category) {
         return datasetRepository.findByCategory(category).stream()
-                .map(this::convertToDTO)
+                .map(dataset -> convertToDTO(dataset, false))
                 .collect(Collectors.toList());
     }
 
     public DatasetDTO createDataset(Dataset dataset) {
         datasetRepository.insert(dataset);
-        return getDatasetById(dataset.getId());
+        Dataset created = datasetRepository.findById(dataset.getId());
+        return convertToDTO(created, false);
     }
 
-    private DatasetDTO convertToDTO(Dataset dataset) {
+    /** 仅投影后的数据点，不带各维度原始值（供 /visualization/data-points 使用） */
+    public List<DatasetDTO.DataPoint> getDataPoints(Long id) {
+        Dataset dataset = datasetRepository.findById(id);
+        if (dataset == null) {
+            throw new IllegalArgumentException("Dataset not found with id: " + id);
+        }
+        List<DatasetDTO.FeatureInfo> features = parseFeatures(dataset.getFeatures());
+        Projection projection = buildProjection(features);
+        return projectDataPoints(parseRows(dataset.getDataContent()), projection, null);
+    }
+
+    private DatasetDTO convertToDTO(Dataset dataset, boolean withDimensionValues) {
         DatasetDTO dto = new DatasetDTO();
         dto.setId(dataset.getId());
         dto.setName(dataset.getName());
@@ -60,7 +74,11 @@ public class DatasetService {
         List<DatasetDTO.FeatureInfo> features = parseFeatures(dataset.getFeatures());
         Projection projection = buildProjection(features);
         dto.setFeatures(projectFeatures(features, projection));
-        dto.setDataPoints(projectDataPoints(parseRows(dataset.getDataContent()), projection));
+        dto.setDataPoints(projectDataPoints(parseRows(dataset.getDataContent()), projection,
+                withDimensionValues ? features : null));
+        if (withDimensionValues) {
+            dto.setDimensions(features);
+        }
 
         return dto;
     }
@@ -162,7 +180,8 @@ public class DatasetService {
 
     private List<DatasetDTO.DataPoint> projectDataPoints(
             List<LinkedHashMap<String, Object>> rows,
-            Projection projection) {
+            Projection projection,
+            List<DatasetDTO.FeatureInfo> valueFeatures) {
         List<DatasetDTO.DataPoint> points = new ArrayList<>();
         for (LinkedHashMap<String, Object> row : rows) {
             Double x = asDouble(row.get(projection.xName()));
@@ -198,9 +217,30 @@ public class DatasetService {
                 clusterId = asInteger(row.get("cluster_id"));
             }
             point.setClusterId(clusterId);
+            if (valueFeatures != null) {
+                point.setValues(buildRowValues(row, valueFeatures));
+            }
             points.add(point);
         }
         return points;
+    }
+
+    /**
+     * 取该行在声明维度上的原始数值，按 features 的声明顺序输出。
+     * 按元数据遍历而非 row.keySet()，可避免 clusterId 之类的非声明键混入；
+     * 文本型 label（如 iris 的 species）因无法转成数值而自动跳过，数值型 label（如 medv）保留。
+     */
+    private Map<String, Double> buildRowValues(
+            LinkedHashMap<String, Object> row,
+            List<DatasetDTO.FeatureInfo> features) {
+        Map<String, Double> values = new LinkedHashMap<>();
+        for (DatasetDTO.FeatureInfo feature : features) {
+            Double value = asDouble(row.get(feature.getName()));
+            if (value != null) {
+                values.put(feature.getName(), value);
+            }
+        }
+        return values;
     }
 
     private Double asDouble(Object value) {

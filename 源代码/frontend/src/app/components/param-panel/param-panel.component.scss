@@ -11,6 +11,9 @@
     position: sticky;
     top: 0;
     z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     background: #ffffff !important;
     padding: 16px 20px !important;
     margin: 0 !important;
@@ -21,6 +24,27 @@
       font-size: 18px !important;
       font-weight: 800 !important;
       margin: 0 !important;
+    }
+  }
+
+  .reset-defaults-button {
+    flex-shrink: 0;
+    margin-left: 12px;
+    padding: 0 8px;
+    min-width: auto;
+    line-height: 30px;
+    border-radius: 8px;
+    color: #0f172a;
+    font-size: 13px;
+    font-weight: 600;
+    transition: background-color 160ms ease, color 160ms ease;
+
+    &:hover:not(:disabled) {
+      background: rgba(15, 23, 42, 0.06);
+    }
+
+    &:disabled {
+      color: #cbd5e1;
     }
   }
 }

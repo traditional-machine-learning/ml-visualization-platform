@@ -10,6 +10,7 @@ export class ParamPanelComponent {
   @Input() algorithm: Algorithm | null = null;
   @Input() parameterValues: any = {};
   @Output() parameterChange = new EventEmitter<{ paramName: string, value: any }>();
+  @Output() resetDefaults = new EventEmitter<void>();
 
   onNumberChange(paramName: string, event: any) {
     this.parameterChange.emit({
@@ -30,6 +31,13 @@ export class ParamPanelComponent {
       paramName,
       value
     });
+  }
+
+  onResetDefaults() {
+    if (!this.algorithm) {
+      return;
+    }
+    this.resetDefaults.emit();
   }
 
   formatValue(param: ParameterDef, value: number): string {

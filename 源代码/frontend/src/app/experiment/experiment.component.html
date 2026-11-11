@@ -43,14 +43,15 @@
         [trainingState]="trainingState">
       </app-visualization-canvas>
 
-      <app-evaluation-panel [evaluation]="evaluationState"></app-evaluation-panel>
+      <app-evaluation-panel [evaluation]="evaluationState" [pca]="pcaSummary"></app-evaluation-panel>
     </div>
 
     <div class="right-panel">
       <app-param-panel
         [algorithm]="selectedAlgorithm"
         [parameterValues]="parameterValues"
-        (parameterChange)="onParameterChange($event.paramName, $event.value)">
+        (parameterChange)="onParameterChange($event.paramName, $event.value)"
+        (resetDefaults)="onResetDefaultParameters()">
       </app-param-panel>
 
       <mat-card class="control-card">

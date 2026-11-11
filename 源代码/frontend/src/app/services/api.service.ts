@@ -1,5 +1,5 @@
 import { Injectable } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpParams } from '@angular/common/http';
 import { Observable } from 'rxjs';
 import {
   ApiResponse,
@@ -7,6 +7,7 @@ import {
   Algorithm,
   TrainingMetrics,
   TrainingModelData,
+  TrainingProjection,
   TrainingSimulationResponse
 } from '../models/algorithm.model';
 import { environment } from '../../environments/environment';
@@ -109,6 +110,15 @@ export class ApiService {
 
   getDecisionBoundary(sessionId: number): Observable<ApiResponse<TrainingModelData>> {
     return this.http.get<ApiResponse<TrainingModelData>>(`${this.baseUrl}/visualization/decision-boundary/${sessionId}`);
+  }
+
+  /** 把当前模型投影到所选的两个维度上（全维模型按平面切片重新求几何） */
+  getProjection(sessionId: number, xName: string, yName: string): Observable<ApiResponse<TrainingProjection>> {
+    const params = new HttpParams().set('xName', xName).set('yName', yName);
+    return this.http.get<ApiResponse<TrainingProjection>>(
+      `${this.baseUrl}/visualization/projection/${sessionId}`,
+      { params }
+    );
   }
 
   getTrainingMetrics(sessionId: number): Observable<ApiResponse<TrainingMetrics>> {

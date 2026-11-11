@@ -1,6 +1,7 @@
 import { Component, OnDestroy, OnInit } from '@angular/core';
-import { forkJoin } from 'rxjs';
-import { Algorithm, Dataset, TrainingSimulationResponse, TrainingState } from '../models/algorithm.model';
+import { NavigationEnd, Router } from '@angular/router';
+import { filter, forkJoin, Subscription } from 'rxjs';
+import { Algorithm, Dataset, TrainingModelData, TrainingSimulationResponse, TrainingState } from '../models/algorithm.model';
 import {
   CaseGuidanceState,
   EvaluationPanelState,
@@ -12,6 +13,8 @@ import { ApiService } from '../services/api.service';
 import { ExperimentContextService } from '../services/experiment-context.service';
 import { environment } from '../../environments/environment';
 import { TrainingLogEntry } from '../components/training-log/training-log.component';
+import { describePcaComponents } from '../utils/pca-labels';
+import { PcaSummary } from '../models/pca.model';
 
 @Component({
   selector: 'app-experiment',
@@ -42,6 +45,8 @@ export class ExperimentComponent implements OnInit, OnDestroy {
   explanationState: ModelExplanationState | null = null;
   trainingLog: TrainingLogEntry[] = [];
   statusBanner = '选择算法、数据集或引导式案例以开始。';
+  /** PCA 专用结果摘要（方差解释率 + 载荷矩阵），非 PCA 算法为 null */
+  pcaSummary: PcaSummary | null = null;
 
   private trainingTimer: ReturnType<typeof setInterval> | null = null;
   private stepInFlight = false;
@@ -49,16 +54,29 @@ export class ExperimentComponent implements OnInit, OnDestroy {
   private apiAlgorithms: Algorithm[] = [];
   private apiDatasets: Dataset[] = [];
   private catalogLoaded = false;
+  private navigationSub: Subscription | null = null;
   useMockFallback = environment.demoMode;
 
   constructor(
     private learningGuideData: LearningGuideDataService,
     private apiService: ApiService,
-    private experimentContext: ExperimentContextService
+    private experimentContext: ExperimentContextService,
+    private router: Router
   ) {}
 
   ngOnInit(): void {
     this.guidedCases = this.learningGuideData.getGuidedCases();
+
+    // 本组件被路由策略缓存后不会被销毁，切走再切回时不会重新初始化。
+    // 但缓存期间视图已脱离文档，ECharts 容器尺寸可能失效，返回时需按当前尺寸重算布局。
+    this.navigationSub = this.router.events
+      .pipe(filter((event): event is NavigationEnd => event instanceof NavigationEnd))
+      .subscribe((event) => {
+        if (event.urlAfterRedirects.split('?')[0].startsWith('/experiment')) {
+          setTimeout(() => window.dispatchEvent(new Event('resize')), 60);
+        }
+      });
+
     const defaultCase = this.guidedCases.find((item) => item.id === 'case-linear-weights') || this.guidedCases[0];
     if (this.useMockFallback) {
       if (defaultCase) {
@@ -74,6 +92,8 @@ export class ExperimentComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.clearTrainingTimer();
+    this.navigationSub?.unsubscribe();
+    this.navigationSub = null;
   }
 
   getTotalSteps(): number {
@@ -93,6 +113,10 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     return 8; // Fallback default
   }
 
+  get isPcaAlgorithm(): boolean {
+    return this.selectedAlgorithm?.name === 'pca';
+  }
+
   onAlgorithmSelect(algorithm: Algorithm): void {
     this.selectedAlgorithm = algorithm;
     this.parameterValues = this.buildParameterValues(algorithm, {});
@@ -101,13 +125,48 @@ export class ExperimentComponent implements OnInit, OnDestroy {
   }
 
   onDatasetSelect(dataset: Dataset): void {
-    this.selectedDataset = dataset;
+    this.setSelectedDataset(dataset);
     this.resetTraining(false);
+  }
+
+  /**
+   * 统一的数据集赋值入口。列表接口只返回投影后的两个维度，这里再拉一次详情接口，
+   * 补上全维度元数据与每行原始值，画布的坐标轴选择器才有可选项。
+   * 详情拉取失败时保持精简版，选择器退化为投影的两轴，不影响其他功能。
+   */
+  private setSelectedDataset(dataset: Dataset | null): void {
+    this.selectedDataset = dataset;
+    if (!dataset || this.useMockFallback) {
+      return;
+    }
+    const id = dataset.id;
+    this.apiService.getDatasetById(id).subscribe({
+      next: (response) => {
+        // 防止慢响应的 A 数据集覆盖已切到 B 的选中项
+        if (response.success && this.selectedDataset?.id === id) {
+          this.selectedDataset = response.data;
+        }
+      },
+      error: () => { /* 保持精简版数据 */ }
+    });
   }
 
   onParameterChange(paramName: string, value: any): void {
     this.parameterValues[paramName] = value;
     // Update totalSteps if iterations/maxIterations changed
+    this.trainingState.totalSteps = this.getTotalSteps();
+    this.refreshInsightPanels();
+  }
+
+  /**
+   * 将当前算法的全部超参数恢复为定义中的默认值。
+   * 与单个参数调整一致，只刷新参数与派生状态，不打断正在进行的训练。
+   */
+  onResetDefaultParameters(): void {
+    if (!this.selectedAlgorithm) {
+      return;
+    }
+    this.parameterValues = this.buildParameterValues(this.selectedAlgorithm, {});
     this.trainingState.totalSteps = this.getTotalSteps();
     this.refreshInsightPanels();
   }
@@ -158,7 +217,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     const loaded = this.learningGuideData.loadCase(caseId);
     this.activeCaseId = caseId;
     this.selectedAlgorithm = loaded.algorithm;
-    this.selectedDataset = loaded.dataset;
+    this.setSelectedDataset(loaded.dataset);
     this.parameterValues = this.buildParameterValues(loaded.algorithm, loaded.parameters);
     this.resetTraining(false);
   }
@@ -175,7 +234,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     if (!algorithm || !dataset) {
       this.activeCaseId = null;
       this.selectedAlgorithm = null;
-      this.selectedDataset = null;
+      this.setSelectedDataset(null);
       this.parameterValues = {};
       this.resetTraining(false);
       this.statusBanner = `引导式案例"${guidedCase.title}"缺少API数据。`;
@@ -184,7 +243,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
 
     this.activeCaseId = caseId;
     this.selectedAlgorithm = algorithm;
-    this.selectedDataset = dataset;
+    this.setSelectedDataset(dataset);
     this.parameterValues = this.buildParameterValues(algorithm, guidedCase.parameterPreset);
     this.resetTraining(false);
   }
@@ -205,7 +264,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     }
     this.activeCaseId = null;
     this.selectedAlgorithm = null;
-    this.selectedDataset = null;
+    this.setSelectedDataset(null);
     this.parameterValues = {};
     this.resetTraining(false);
     this.statusBanner = 'API不可用。未找到本地演示案例。';
@@ -239,6 +298,12 @@ export class ExperimentComponent implements OnInit, OnDestroy {
       return;
     }
 
+    // PCA 是一次性计算，没有逐步训练流程，直接走降维接口
+    if (this.isPcaAlgorithm) {
+      this.runPca();
+      return;
+    }
+
     const requestVersion = this.clearTrainingTimer();
     this.appendTrainingLog('Training request sent to backend.', 'neutral', this.trainingState.currentStep);
     this.apiService.startTraining(this.selectedAlgorithm.id, this.selectedDataset.id, this.parameterValues).subscribe({
@@ -262,6 +327,84 @@ export class ExperimentComponent implements OnInit, OnDestroy {
     });
   }
 
+  /**
+   * 执行 PCA 降维。PCA 没有训练轮次，一次请求就返回全部结果，
+   * 因此这里不走轮询，也不需要 sessionId。
+   */
+  private runPca(): void {
+    if (!this.selectedAlgorithm || !this.selectedDataset) {
+      return;
+    }
+
+    const algorithmId = this.selectedAlgorithm.id;
+    const datasetId = this.selectedDataset.id;
+    const requestVersion = this.clearTrainingTimer();
+    this.trainingState = { ...this.trainingState, status: 'training' };
+    this.statusBanner = '正在计算主成分...';
+    this.appendTrainingLog(
+      `执行 PCA 降维：${this.selectedDataset.name}，主成分数 ${this.parameterValues['n_components'] ?? 2}`,
+      'neutral',
+      this.trainingState.currentStep
+    );
+    this.refreshInsightPanels();
+
+    this.apiService.startPca(algorithmId, datasetId, this.parameterValues).subscribe({
+      next: (response) => {
+        if (!this.isCurrentRequest(requestVersion)) {
+          return;
+        }
+        if (!response.success) {
+          this.handleTrainingError();
+          return;
+        }
+        this.applyTrainingResponse(response.data);
+        this.trainingState = { ...this.trainingState, status: 'completed' };
+
+        const summary = this.pcaSummary;
+        if (summary && summary.cumulative.length) {
+          const total = summary.cumulative[summary.cumulative.length - 1];
+          const detail = summary.explained
+            .map((ratio, index) => `PC${index + 1} ${(ratio * 100).toFixed(1)}%`)
+            .join('、');
+          this.appendTrainingLog(
+            `PCA 完成：${detail}，累计解释 ${(total * 100).toFixed(1)}% 方差`,
+            'success',
+            this.trainingState.currentStep
+          );
+          this.statusBanner = `PCA 降维完成，前 ${summary.k} 个主成分解释了 ${(total * 100).toFixed(1)}% 的方差。`;
+        } else {
+          this.appendTrainingLog('PCA 完成，但该数据集没有可用的数值特征。', 'warning', 0);
+          this.statusBanner = '该数据集缺少数值特征，无法执行 PCA。';
+        }
+        this.refreshInsightPanels();
+      },
+      error: () => {
+        if (this.isCurrentRequest(requestVersion)) {
+          this.handleTrainingError();
+        }
+      }
+    });
+  }
+
+  private buildPcaSummary(modelData?: TrainingModelData): PcaSummary | null {
+    if (!modelData?.pcaTransformed?.length || !modelData.pcaComponents?.length) {
+      return null;
+    }
+    const components = modelData.pcaComponents;
+    const names = modelData.featureNames ?? [];
+    const loadings = names.map((name, featureIndex) => ({
+      name,
+      values: components.map((component) => component[featureIndex] ?? 0)
+    }));
+    return {
+      k: components.length,
+      explained: modelData.pcaExplainedVariance ?? [],
+      cumulative: modelData.pcaCumulativeVariance ?? [],
+      loadings,
+      labels: describePcaComponents(modelData)
+    };
+  }
+
   onTrainStep(): void {
     if (!this.selectedAlgorithm || !this.selectedDataset) {
       return;
@@ -280,6 +423,11 @@ export class ExperimentComponent implements OnInit, OnDestroy {
       } else {
         this.trainingState.status = 'paused';
       }
+      return;
+    }
+
+    if (this.isPcaAlgorithm) {
+      this.runPca();
       return;
     }
 
@@ -375,6 +523,7 @@ export class ExperimentComponent implements OnInit, OnDestroy {
       accuracy: 0.36,
       scoreLabel: 'Accuracy'
     };
+    this.pcaSummary = null;
     if (resetSelections) {
       this.selectedAlgorithm = null;
       this.selectedDataset = null;
@@ -469,20 +618,25 @@ export class ExperimentComponent implements OnInit, OnDestroy {
   }
 
   private applyTrainingResponse(response: TrainingSimulationResponse): void {
-    // Keep the totalSteps from parameters, only use API response if it matches
-    const totalSteps = this.getTotalSteps();
+    // 决策树一步 = 一次分裂、随机森林一步 = 一棵树，总步数只有后端知道，必须用返回值；
+    // 其余算法沿用参数推导出的步数
+    const name = this.selectedAlgorithm?.name;
+    const totalSteps = (name === 'decision_tree' || name === 'random_forest' || name === 'pca') && response.totalSteps > 0
+      ? response.totalSteps
+      : this.getTotalSteps();
     this.trainingState = {
       ...this.trainingState,
       sessionId: response.sessionId,
       status: this.normalizeStatus(response.status),
       currentStep: response.currentStep,
-      totalSteps: totalSteps, // Use parameter-based totalSteps instead of API default
+      totalSteps: totalSteps,
       loss: response.loss,
       accuracy: response.accuracy,
       scoreLabel: response.scoreLabel,
       metrics: response.metrics,
       modelData: response.modelData
     };
+    this.pcaSummary = this.isPcaAlgorithm ? this.buildPcaSummary(response.modelData) : null;
     this.refreshInsightPanels();
   }
 

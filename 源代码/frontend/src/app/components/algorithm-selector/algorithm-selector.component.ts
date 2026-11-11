@@ -61,9 +61,6 @@ export class AlgorithmSelectorComponent implements OnInit, OnChanges {
     if (!names.includes('pca')) {
       extras.push({ id: -101, name: 'pca', displayName: 'PCA', description: '降维：主成分分析', category: 'unsupervised', type: 'pca', parameters: [] } as Algorithm);
     }
-    if (!names.includes('random_forest') && !names.includes('rf') ) {
-      extras.push({ id: -102, name: 'random_forest', displayName: '随机森林', description: '集成学习：随机森林（后端需支持）', category: 'supervised', type: 'ensemble', parameters: [] } as Algorithm);
-    }
     if (extras.length) {
       this.algorithms = [...this.algorithms, ...extras];
     }

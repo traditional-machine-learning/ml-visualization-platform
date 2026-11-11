@@ -2,10 +2,14 @@ import { Algorithm, Dataset, TrainingState } from './algorithm.model';
 
 export interface MetricCard {
   label: string;
-  value: number;
+  /** 训练尚未开始时为 undefined：卡片只显示标签，不显示任何数字 */
+  value?: number;
   suffix?: string;
   display?: 'ratioPercent' | 'percent' | 'number';
-  trend?: string;
+  /** 与上一步相比的真实变化量，正负号表示增减；没有上一步时为 undefined（不显示） */
+  delta?: number;
+  /** 该指标是否越小越好（损失类），用于决定 delta 的红绿方向 */
+  lowerIsBetter?: boolean;
   tone: 'cyan' | 'purple' | 'green' | 'amber';
   icon: string;
 }
@@ -23,6 +27,8 @@ export interface EvaluationPanelState {
   chart: TrainingPoint[];
   scoreLabel: string;
   lossLabel: string;
+  /** 训练总步数，用于把训练轨迹的横轴固定为 0..totalSteps */
+  totalSteps?: number;
 }
 
 export interface ExplanationTreeNode {

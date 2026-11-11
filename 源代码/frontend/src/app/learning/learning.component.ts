@@ -1,4 +1,7 @@
-import { Component } from '@angular/core';
+import { Component, OnDestroy, OnInit } from '@angular/core';
+import { NavigationEnd, NavigationStart, Router } from '@angular/router';
+import { Subscription } from 'rxjs';
+import { createQuestionBank, QuizQuestion } from './learning-question-bank';
 
 interface Lesson {
   id: string;
@@ -22,7 +25,7 @@ interface Lesson {
   templateUrl: './learning.component.html',
   styleUrls: ['./learning.component.scss']
 })
-export class LearningComponent {
+export class LearningComponent implements OnInit, OnDestroy {
   readonly lessons: Lesson[] = [
     {
       id: 'intro', title: '机器学习简介', category: '入门基础', duration: '10 分钟',
@@ -154,35 +157,124 @@ export class LearningComponent {
       checkQuestion: '正类只占很少一部分时，为什么不能只看准确率？', checkAnswer: '因为模型即使把所有样本都判为数量占多数的负类，也能得到很高准确率，却完全找不到正类。此时应额外查看召回率、精确率、F1 或混淆矩阵。', checkOptions: ['准确率只能用于回归', '模型全部预测为负类也可能准确率很高，却找不到正类', '正类越少，准确率一定为零', '准确率会自动变成召回率'], checkAnswerIndex: 1
     }
   ];
+
+  readonly questionBank: QuizQuestion[] = createQuestionBank();
+
   activeId = 'intro';
   completed = new Set<string>();
+  showAnswer = false;
   lessonCheckChoice: number | null = null;
   lessonCheckSubmitted = false;
+  view: 'lesson' | 'quiz' | 'wrongbook' = 'lesson';
+  currentQuizQuestions: QuizQuestion[] = [];
+  quizAnswers: Record<string, number> = {};
+  quizSubmitted = false;
+  quizScore: number | null = null;
+  wrongQuestionIds: string[] = this.loadWrongQuestionIds();
+
+  /** 离开学习中心前的窗口滚动位置，返回时用来还原浏览位置。 */
+  private savedScrollTop = 0;
+  private navigationSub: Subscription | null = null;
+
+  constructor(private router: Router) {}
+
+  ngOnInit(): void {
+    this.navigationSub = this.router.events.subscribe((event) => {
+      // 离开学习中心前一刻抓取真实滚动位置：此时旧视图还在文档中，读到的值才准确
+      if (event instanceof NavigationStart) {
+        if (this.isLearningUrl(this.router.url) && !this.isLearningUrl(event.url)) {
+          this.savedScrollTop = window.scrollY;
+        }
+        return;
+      }
+      // 回到学习中心后，等视图重新挂载并完成布局再还原
+      if (event instanceof NavigationEnd && this.isLearningUrl(event.urlAfterRedirects)) {
+        setTimeout(() => window.scrollTo({ top: this.savedScrollTop }), 60);
+      }
+    });
+  }
+
+  ngOnDestroy(): void {
+    this.navigationSub?.unsubscribe();
+    this.navigationSub = null;
+  }
+
+  private isLearningUrl(url: string): boolean {
+    return url.split('?')[0].startsWith('/learn');
+  }
 
   get activeLesson(): Lesson { return this.lessons.find(lesson => lesson.id === this.activeId) || this.lessons[0]; }
   get progress(): number { return Math.round(this.completed.size / this.lessons.length * 100); }
   get activeIndex(): number { return this.lessons.findIndex(lesson => lesson.id === this.activeId); }
+  get wrongQuestions(): QuizQuestion[] { return this.wrongQuestionIds.map(id => this.questionBank.find(question => question.id === id)).filter((question): question is QuizQuestion => !!question); }
+  get questionCount(): number { return this.questionBank.length; }
+  get answeredCount(): number { return this.currentQuizQuestions.filter(question => this.quizAnswers[question.id] !== undefined).length; }
+  lessonTitle(lessonId: string): string { return this.lessons.find(lesson => lesson.id === lessonId)?.title || '课程知识'; }
 
-  selectLesson(id: string): void {
-    this.activeId = id;
-    this.lessonCheckChoice = null;
-    this.lessonCheckSubmitted = false;
-  }
-
-  submitLessonCheck(): void {
-    if (this.lessonCheckChoice !== null) this.lessonCheckSubmitted = true;
-  }
-
-  resetLessonCheck(): void {
-    this.lessonCheckChoice = null;
-    this.lessonCheckSubmitted = false;
-  }
-
+  selectLesson(id: string): void { this.activeId = id; this.showAnswer = false; this.lessonCheckChoice = null; this.lessonCheckSubmitted = false; }
+  openLesson(lessonId: string): void { this.selectLesson(lessonId); this.openLessons(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+  toggleAnswer(): void { this.showAnswer = !this.showAnswer; }
+  submitLessonCheck(): void { if (this.lessonCheckChoice !== null) this.lessonCheckSubmitted = true; }
+  resetLessonCheck(): void { this.lessonCheckChoice = null; this.lessonCheckSubmitted = false; }
   markComplete(): void { this.completed.add(this.activeId); }
-
+  openLessons(): void { this.view = 'lesson'; }
+  openWrongbook(): void { this.view = 'wrongbook'; window.scrollTo({ top: 0, behavior: 'smooth' }); }
+  startQuiz(fromWrongbook = false): void {
+    const shuffled = (questions: QuizQuestion[]) => [...questions].sort(() => Math.random() - 0.5);
+    if (fromWrongbook && this.wrongQuestions.length) {
+      const wrongIds = new Set(this.wrongQuestions.map(question => question.id));
+      const wrong = shuffled(this.wrongQuestions);
+      const extra = shuffled(this.questionBank.filter(question => !wrongIds.has(question.id))).slice(0, Math.max(0, 5 - wrong.length));
+      this.currentQuizQuestions = [...wrong.slice(0, 5), ...extra].slice(0, 5);
+    } else {
+      this.currentQuizQuestions = shuffled(this.questionBank).slice(0, 5);
+    }
+    this.quizAnswers = {};
+    this.quizSubmitted = false;
+    this.quizScore = null;
+    this.view = 'quiz';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  chooseOption(questionId: string, optionIndex: number): void {
+    if (!this.quizSubmitted) this.quizAnswers[questionId] = optionIndex;
+  }
+  submitQuiz(): void {
+    if (this.answeredCount !== this.currentQuizQuestions.length || this.quizSubmitted) return;
+    const wrong = this.currentQuizQuestions.filter(question => this.quizAnswers[question.id] !== question.answerIndex);
+    this.quizScore = (this.currentQuizQuestions.length - wrong.length) * 20;
+    this.wrongQuestionIds = [...new Set([...this.wrongQuestionIds, ...wrong.map(question => question.id)])];
+    this.saveWrongQuestionIds();
+    this.quizSubmitted = true;
+  }
   goTo(offset: number): void {
     const nextIndex = Math.max(0, Math.min(this.lessons.length - 1, this.activeIndex + offset));
-    this.selectLesson(this.lessons[nextIndex].id);
+    this.activeId = this.lessons[nextIndex].id;
+    this.showAnswer = false;
+    this.lessonCheckChoice = null;
+    this.lessonCheckSubmitted = false;
     window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  private loadWrongQuestionIds(): string[] {
+    try {
+      const stored = typeof localStorage === 'undefined' ? null : localStorage.getItem('ml-learning-wrong-questions');
+      const parsed = stored ? JSON.parse(stored) : [];
+      if (!Array.isArray(parsed)) return [];
+      const validIds = new Set(this.questionBank.map(question => question.id));
+      const legacyLessonIds = new Set(this.lessons.map(lesson => lesson.id));
+      const migrated = parsed.flatMap((id: unknown) => {
+        if (typeof id !== 'string') return [];
+        if (validIds.has(id)) return [id];
+        const lessonId = id.replace(/-\d+$/, '');
+        if (!legacyLessonIds.has(lessonId)) return [];
+        const replacement = this.questionBank.find(question => question.lessonId === lessonId);
+        return replacement ? [replacement.id] : [];
+      });
+      return [...new Set(migrated)];
+    } catch { return []; }
+  }
+
+  private saveWrongQuestionIds(): void {
+    try { localStorage.setItem('ml-learning-wrong-questions', JSON.stringify(this.wrongQuestionIds)); } catch { /* Keep the current session usable if storage is unavailable. */ }
   }
 }
