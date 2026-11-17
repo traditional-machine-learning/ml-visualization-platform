@@ -21,6 +21,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cd frontend && npm run dev      # 只跑前端
 cd backend && mvn spring-boot:run        # 只跑后端（需 JDK 17 与 DB_* 环境变量）
 ./scripts/sync-to-ct-platform.sh         # 同步到 ct-platform-v2 并跑构建
+
+# Windows（CMD / PowerShell）
+scripts\start-dev.bat [--platform]      # 同上，等价于 start-dev.sh
+scripts\stop-dev.bat [--mysql]          # 同上，等价于 stop-dev.sh
 ```
 
 ## 关键约束

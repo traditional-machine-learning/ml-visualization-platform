@@ -79,9 +79,18 @@ init_data() {
   echo "  ✓ 初始化完成（root 为空密码，仅本机 socket 可连）"
 }
 
+port_taken() {
+  nc -z -G 1 127.0.0.1 "$PORT" >/dev/null 2>&1     || lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1
+}
+
 start_server() {
   if running; then
     return 0
+  fi
+  if port_taken; then
+    echo "端口 ${PORT} 已被其它程序占用（不是本项目的数据库实例）。" >&2
+    echo "请先释放该端口，或用 DB_PORT=其他端口 重新运行。" >&2
+    exit 1
   fi
   init_data
   echo "启动项目数据库（端口 ${PORT}）……"

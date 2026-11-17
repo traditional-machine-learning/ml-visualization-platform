@@ -71,13 +71,16 @@ ml-visualization-platform/
 | Node.js | 18+ | 前端构建 |
 | MySQL | 8.x | **只需安装，不用建库/建账号**；脚本会在项目内起独立实例（端口 3308） |
 
-支持 macOS / Linux。Windows 建议在 WSL2 里跑（脚本是 bash）。
+**Windows 原生支持**：提供 `scripts\start-dev.bat` / `scripts\stop-dev.bat`，无需 WSL。
+macOS / Linux 用 `scripts/*.sh`。
 
 > 首次运行会：生成 `.dev/env`（随机数据库口令）→ 初始化 `.dev/mysql` 数据目录 →
 > 建库建号 → 导入 `schema.sql` → 下载 Maven 依赖与 npm 包。
 > 全部完成后访问 http://localhost:5174 即可。
 
 ## 一键启停（推荐）
+
+**macOS / Linux**
 
 ```bash
 ./scripts/start-dev.sh                  # 数据库 + 后端 8080 + 前端 5174
@@ -89,6 +92,26 @@ ml-visualization-platform/
 - 数据库是**项目自带实例**（`.dev/mysql`，端口 3308），以当前用户身份运行，**不需要 sudo、不需要 root 密码**
 - 首次运行会自动初始化数据目录、建库建号、导入 schema，并从系统 3306 实例迁移一次数据
 - 日志与 PID 在 `.dev/`（已 gitignore）；数据库账号密码在 `.dev/env`
+
+**Windows**（PowerShell 或 CMD 里均可）
+
+```bat
+scripts\start-dev.bat              :: 数据库 + 后端 8080 + 前端 5174
+scripts\start-dev.bat --platform   :: 再加主平台前端 5173
+scripts\stop-dev.bat               :: 关闭后端与前端
+scripts\stop-dev.bat --mysql       :: 连项目数据库一起关
+```
+
+Windows 脚本会：
+
+- 从 `JAVA_HOME` 或 `%ProgramFiles%\Eclipse Adoptium\jdk-17*` 等位置找 **JDK 17**，并校验版本
+- 从 `MYSQL_HOME` 或 `%ProgramFiles%\MySQL\MySQL Server 8.*` 找 MySQL 8
+- 用 `%RANDOM%` 之外的安全方式生成随机数据库口令写入 `.dev\env`
+- 在 `.dev\mysql\data` 初始化项目自己的 MySQL 实例（端口 3308），**不需要管理员权限**，
+  不会动你系统里已有的 MySQL 服务
+- 三个服务各自在独立的最小化窗口里运行，日志写入 `.dev\backend.log` / `.dev\frontend.log`
+
+> 同一台机器上 `.bat` 与 `.sh` 二选一即可；两者使用同一份 `.dev/` 数据与端口。
 
 ## 手动运行
 
