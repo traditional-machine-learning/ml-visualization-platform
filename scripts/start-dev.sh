@@ -86,6 +86,14 @@ export JAVA_HOME="$JDK17"
 export PATH="$JDK17/bin:$PATH"
 echo "使用 JDK：$JDK17"
 
+# 工具缺失就立刻停下，不要等到构建/装依赖时才报错
+for tool in mvn node npm; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "缺少 $tool：请先安装并加入 PATH（$tool --version 能正常运行后再试）。" >&2
+    exit 1
+  fi
+done
+
 # lsof 有时看不到别的用户（如 _mysql）持有的监听端口，先试 TCP 探测再退回 lsof
 port_busy() {
   nc -z -G 1 127.0.0.1 "$1" >/dev/null 2>&1 && return 0
@@ -105,10 +113,26 @@ wait_for_port() {
   return 1
 }
 
+# ---------- 端口预检 ----------
+# 先把「端口被别的程序占用」这种情况挡在启动之前，避免起了数据库/后端才发现前端起不来
+if port_busy 8080 && ! curl -s -m 2 http://127.0.0.1:8080/api/health 2>/dev/null | grep -q '"service":"ct-platform-backend"'; then
+  echo "8080 被别的程序占用（不是本项目的后端）。请先释放该端口。" >&2
+  echo "查看占用：lsof -nP -iTCP:8080 -sTCP:LISTEN" >&2
+  exit 1
+fi
+if port_busy 5174 && ! curl -s -m 2 http://127.0.0.1:5174/src/views/lab/ExperimentView.vue 2>/dev/null | grep -q "VisualizationCanvas"; then
+  echo "5174 被别的程序占用（不是本项目的页面）。请先释放该端口。" >&2
+  echo "查看占用：lsof -nP -iTCP:5174 -sTCP:LISTEN" >&2
+  exit 1
+fi
+
 # ---------- 数据库（项目自带实例，无需 sudo） ----------
 export DB_PORT="${DB_PORT:-3308}"
 export DB_NAME="${DB_NAME:-ct_platform}"
-bash "$ROOT/scripts/db.sh" ensure
+if ! bash "$ROOT/scripts/db.sh" ensure; then
+  echo "数据库准备失败：请检查 MySQL 安装、端口 ${DB_PORT} 是否被占用（见 .dev/mysql/mysqld.log）。" >&2
+  exit 1
+fi
 
 # ---------- 后端 ----------
 if port_busy 8080; then
@@ -139,7 +163,13 @@ fi
 
 # ---------- 自有前端 ----------
 if port_busy 5174; then
-  echo "⚠ 5174 已被占用，跳过自有前端"
+  if curl -s -m 2 http://127.0.0.1:5174/src/views/lab/ExperimentView.vue 2>/dev/null | grep -q "VisualizationCanvas"; then
+    echo "✓ 前端已在 5174 运行"
+  else
+    echo "5174 被别的程序占用（不是本项目的页面）。请先释放该端口，或停掉占用的程序。" >&2
+    echo "查看占用：lsof -nP -iTCP:5174 -sTCP:LISTEN" >&2
+    exit 1
+  fi
 else
   (
     cd "$ROOT/frontend"
