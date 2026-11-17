@@ -32,7 +32,9 @@ mkdir -p "$DEV"
 # ---------- 数据库账号 ----------
 if [ ! -f "$ENV_FILE" ]; then
   # 首次运行生成随机密码，仓库里不出现任何可用的数据库口令
-  RANDOM_PW="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+  # 注意：不能用 tr | head —— head 提前关闭管道会让 tr 收到 SIGPIPE，
+  # 配合 set -o pipefail 会导致整个脚本直接退出（首次运行时表现为"什么都不输出"）
+  RANDOM_PW="$(openssl rand -hex 12 2>/dev/null || od -An -tx1 -N12 /dev/urandom | tr -d ' \n')"
   cat > "$ENV_FILE" <<ENV
 # 本地开发用的数据库账号（已被 .gitignore 忽略，不要提交）
 DB_USERNAME=ct_app
@@ -56,7 +58,19 @@ jdk_is_17() {
 }
 
 JDK17=""
-for candidate in "${CT_JAVA_HOME:-}" "/opt/homebrew/opt/openjdk@17" "$(/usr/libexec/java_home -v 17 2>/dev/null || true)" "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"; do
+# PATH 里的 java 也可能就是 17（Linux 常见），一并作为候选
+PATH_JAVA_HOME=""
+if command -v java >/dev/null 2>&1; then
+  PATH_JAVA_HOME="$(cd "$(dirname "$(readlink -f "$(command -v java)" 2>/dev/null || command -v java)")/.." 2>/dev/null && pwd || true)"
+fi
+
+for candidate in "${CT_JAVA_HOME:-}" \
+                 "/opt/homebrew/opt/openjdk@17" \
+                 "$(/usr/libexec/java_home -v 17 2>/dev/null || true)" \
+                 "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home" \
+                 "$PATH_JAVA_HOME" \
+                 /usr/lib/jvm/java-17-openjdk-amd64 \
+                 /usr/lib/jvm/java-17-openjdk; do
   [ -n "$candidate" ] || continue
   if jdk_is_17 "$candidate"; then
     JDK17="$candidate"
@@ -65,7 +79,7 @@ for candidate in "${CT_JAVA_HOME:-}" "/opt/homebrew/opt/openjdk@17" "$(/usr/libe
 done
 
 if [ -z "$JDK17" ]; then
-  echo "找不到 JDK 17（可用 CT_JAVA_HOME 指定）" >&2
+  echo "找不到 JDK 17。请安装 JDK 17，或用 CT_JAVA_HOME=/path/to/jdk17 指定。" >&2
   exit 1
 fi
 export JAVA_HOME="$JDK17"

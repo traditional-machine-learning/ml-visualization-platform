@@ -20,7 +20,26 @@ DATA="$DB_DIR/data"
 SOCK="$DB_DIR/mysql.sock"
 PIDFILE="$DB_DIR/mysqld.pid"
 LOGFILE="$DB_DIR/mysqld.log"
-BASEDIR="/usr/local/mysql"
+# MySQL 安装位置：优先 MYSQL_BASEDIR，其次 PATH 里的 mysqld，再试常见目录
+detect_basedir() {
+  if [ -n "${MYSQL_BASEDIR:-}" ] && [ -x "$MYSQL_BASEDIR/bin/mysqld" ]; then
+    printf '%s' "$MYSQL_BASEDIR"; return
+  fi
+  if command -v mysqld >/dev/null 2>&1; then
+    dirname "$(dirname "$(command -v mysqld)")"; return
+  fi
+  for candidate in /usr/local/mysql /opt/homebrew/opt/mysql /opt/homebrew/opt/mysql@8.4 /opt/homebrew/opt/mysql@8.0 /usr; do
+    if [ -x "$candidate/bin/mysqld" ]; then
+      printf '%s' "$candidate"; return
+    fi
+  done
+}
+
+BASEDIR="$(detect_basedir)"
+if [ -z "$BASEDIR" ]; then
+  echo "未找到 MySQL。请安装 MySQL 8，或用 MYSQL_BASEDIR=/path/to/mysql 指定安装目录。" >&2
+  exit 1
+fi
 MYSQLD="$BASEDIR/bin/mysqld"
 MYSQL="$BASEDIR/bin/mysql"
 MYSQLADMIN="$BASEDIR/bin/mysqladmin"
