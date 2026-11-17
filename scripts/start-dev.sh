@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+#
+# 启动机器学习可视化平台（后端 + 前端），可选连动主平台前端。
+#
+#   ./scripts/start-dev.sh                  # 后端 8080 + 自有前端 5174
+#   ./scripts/start-dev.sh --with-platform  # 再加主平台前端 5173（需存在 ct-platform-v2）
+#   ./scripts/start-dev.sh --mysql          # 顺便尝试启动本机 MySQL
+#
+# 日志与 PID 都在 .dev/ 下（已 gitignore）。
+# 数据库账号密码从 .dev/env 读取；文件不存在时按本机开发默认值生成。
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEV="$ROOT/.dev"
+ENV_FILE="$DEV/env"
+PLATFORM_DIR="${CT_PLATFORM_DIR:-$HOME/projects/ct-platform-v2}"
+
+WITH_PLATFORM=0
+WITH_MYSQL=0
+for arg in "$@"; do
+  case "$arg" in
+    --with-platform) WITH_PLATFORM=1 ;;
+    --mysql) echo "提示：现在默认使用项目自带数据库实例，--mysql 已无作用" ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) echo "未知参数: $arg" >&2; exit 2 ;;
+  esac
+done
+
+mkdir -p "$DEV"
+
+# ---------- 数据库账号 ----------
+if [ ! -f "$ENV_FILE" ]; then
+  # 首次运行生成随机密码，仓库里不出现任何可用的数据库口令
+  # 注意：不能用 tr | head —— head 提前关闭管道会让 tr 收到 SIGPIPE，
+  # 配合 set -o pipefail 会导致整个脚本直接退出（首次运行时表现为"什么都不输出"）
+  RANDOM_PW="$(openssl rand -hex 12 2>/dev/null || od -An -tx1 -N12 /dev/urandom | tr -d ' \n')"
+  cat > "$ENV_FILE" <<ENV
+# 本地开发用的数据库账号（已被 .gitignore 忽略，不要提交）
+DB_USERNAME=ct_app
+DB_PASSWORD=${RANDOM_PW}
+# 项目自带 MySQL 实例的端口（scripts/db.sh 管理，无需 sudo）
+DB_PORT=3308
+ENV
+  echo "已生成 ${ENV_FILE}（如需修改账号密码请直接编辑）"
+fi
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+: "${DB_USERNAME:?需要 DB_USERNAME}"
+: "${DB_PASSWORD:?需要 DB_PASSWORD}"
+
+# ---------- JDK 17 ----------
+# 注意：/usr/libexec/java_home -v 17 可能返回更新版本（它按「>=17」匹配），
+# 而 Lombok 在 26/27 上会静默失效，所以必须验证主版本号真的是 17。
+jdk_is_17() {
+  [ -x "$1/bin/java" ] || return 1
+  "$1/bin/java" -version 2>&1 | head -1 | grep -q 'version "17' || return 1
+}
+
+JDK17=""
+# PATH 里的 java 也可能就是 17（Linux 常见），一并作为候选
+PATH_JAVA_HOME=""
+if command -v java >/dev/null 2>&1; then
+  PATH_JAVA_HOME="$(cd "$(dirname "$(readlink -f "$(command -v java)" 2>/dev/null || command -v java)")/.." 2>/dev/null && pwd || true)"
+fi
+
+for candidate in "${CT_JAVA_HOME:-}" \
+                 "/opt/homebrew/opt/openjdk@17" \
+                 "$(/usr/libexec/java_home -v 17 2>/dev/null || true)" \
+                 "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home" \
+                 "$PATH_JAVA_HOME" \
+                 /usr/lib/jvm/java-17-openjdk-amd64 \
+                 /usr/lib/jvm/java-17-openjdk; do
+  [ -n "$candidate" ] || continue
+  if jdk_is_17 "$candidate"; then
+    JDK17="$candidate"
+    break
+  fi
+done
+
+if [ -z "$JDK17" ]; then
+  echo "找不到 JDK 17。请安装 JDK 17，或用 CT_JAVA_HOME=/path/to/jdk17 指定。" >&2
+  exit 1
+fi
+export JAVA_HOME="$JDK17"
+export PATH="$JDK17/bin:$PATH"
+echo "使用 JDK：$JDK17"
+
+# 工具缺失就立刻停下，不要等到构建/装依赖时才报错
+for tool in mvn node npm; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "缺少 $tool：请先安装并加入 PATH（$tool --version 能正常运行后再试）。" >&2
+    exit 1
+  fi
+done
+
+# lsof 有时看不到别的用户（如 _mysql）持有的监听端口，先试 TCP 探测再退回 lsof
+port_busy() {
+  nc -z -G 1 127.0.0.1 "$1" >/dev/null 2>&1 && return 0
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+wait_for_port() {
+  local port="$1" label="$2" tries="${3:-60}"
+  for _ in $(seq 1 "$tries"); do
+    if port_busy "$port"; then
+      echo "  ✓ ${label} 已就绪（:${port}）"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "  ✗ $label 启动超时，看日志：$DEV/$label.log" >&2
+  return 1
+}
+
+# ---------- 端口预检 ----------
+# 先把「端口被别的程序占用」这种情况挡在启动之前，避免起了数据库/后端才发现前端起不来
+if port_busy 8080 && ! curl -s -m 2 http://127.0.0.1:8080/api/health 2>/dev/null | grep -q '"service":"ct-platform-backend"'; then
+  echo "8080 被别的程序占用（不是本项目的后端）。请先释放该端口。" >&2
+  echo "查看占用：lsof -nP -iTCP:8080 -sTCP:LISTEN" >&2
+  exit 1
+fi
+if port_busy 5174 && ! curl -s -m 2 http://127.0.0.1:5174/src/views/lab/ExperimentView.vue 2>/dev/null | grep -q "VisualizationCanvas"; then
+  echo "5174 被别的程序占用（不是本项目的页面）。请先释放该端口。" >&2
+  echo "查看占用：lsof -nP -iTCP:5174 -sTCP:LISTEN" >&2
+  exit 1
+fi
+
+# ---------- 数据库（项目自带实例，无需 sudo） ----------
+export DB_PORT="${DB_PORT:-3308}"
+export DB_NAME="${DB_NAME:-ct_platform}"
+if ! bash "$ROOT/scripts/db.sh" ensure; then
+  echo "数据库准备失败：请检查 MySQL 安装、端口 ${DB_PORT} 是否被占用（见 .dev/mysql/mysqld.log）。" >&2
+  exit 1
+fi
+
+# ---------- 后端 ----------
+if port_busy 8080; then
+  if curl -s -m 2 http://127.0.0.1:8080/api/health 2>/dev/null | grep -q '"service":"ct-platform-backend"'; then
+    echo "✓ 后端已在 8080 运行"
+  else
+    echo "✗ 8080 被别的程序占用（检测到不是本项目的后端）。" >&2
+    echo "  常见原因：另一个后端进程（如旧版本或别的项目）还占着端口" >&2
+    echo "  查看占用：lsof -nP -iTCP:8080 -sTCP:LISTEN" >&2
+    exit 1
+  fi
+else
+  echo "构建并启动后端……"
+  (
+    cd "$ROOT/backend"
+    mvn -B -q -DskipTests -Dmaven.repo.local="${MAVEN_REPO:-$HOME/.m2/repository}" package
+  )
+
+  (
+    cd "$ROOT/backend"
+    SPRING_DATASOURCE_URL="jdbc:mysql://127.0.0.1:${DB_PORT}/${DB_NAME}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true" \
+    DB_USERNAME="$DB_USERNAME" DB_PASSWORD="$DB_PASSWORD" \
+      nohup java -jar target/ct-platform-backend-1.0.0.jar > "$DEV/backend.log" 2>&1 &
+    echo $! > "$DEV/backend.pid"
+  )
+  wait_for_port 8080 "后端" 90 || { tail -20 "$DEV/backend.log" >&2; exit 1; }
+fi
+
+# ---------- 自有前端 ----------
+if port_busy 5174; then
+  if curl -s -m 2 http://127.0.0.1:5174/src/views/lab/ExperimentView.vue 2>/dev/null | grep -q "VisualizationCanvas"; then
+    echo "✓ 前端已在 5174 运行"
+  else
+    echo "5174 被别的程序占用（不是本项目的页面）。请先释放该端口，或停掉占用的程序。" >&2
+    echo "查看占用：lsof -nP -iTCP:5174 -sTCP:LISTEN" >&2
+    exit 1
+  fi
+else
+  (
+    cd "$ROOT/frontend"
+    [ -d node_modules ] || npm install --no-audit --no-fund
+    nohup ./node_modules/.bin/vite --port 5174 --strictPort > "$DEV/frontend.log" 2>&1 &
+    echo $! > "$DEV/frontend.pid"
+  )
+  wait_for_port 5174 "frontend" 60
+fi
+
+# ---------- 主平台前端（可选） ----------
+if [ "$WITH_PLATFORM" -eq 1 ]; then
+  if [ ! -d "$PLATFORM_DIR/frontend" ]; then
+    echo "⚠ 找不到 $PLATFORM_DIR/frontend，跳过主平台前端" >&2
+  elif port_busy 5173; then
+    echo "⚠ 5173 已被占用，跳过主平台前端"
+  else
+    (
+      cd "$PLATFORM_DIR/frontend"
+      [ -d node_modules ] || npm install --no-audit --no-fund
+      nohup ./node_modules/.bin/vite --port 5173 --strictPort > "$DEV/platform.log" 2>&1 &
+      echo $! > "$DEV/platform.pid"
+    )
+    wait_for_port 5173 "platform" 60
+  fi
+fi
+
+echo
+echo "启动完成："
+echo "  自有项目   http://localhost:5174"
+[ "$WITH_PLATFORM" -eq 1 ] && echo "  主平台     http://localhost:5173  →「人工智能」"
+echo "  数据库     127.0.0.1:${DB_PORT}（scripts/db.sh 管理）"
+echo "  后端接口   http://localhost:8080/api/health"
+echo "  日志目录   $DEV"
+echo "  关闭项目   ./scripts/stop-dev.sh"
