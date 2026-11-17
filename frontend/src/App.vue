@@ -11,9 +11,9 @@
       </nav>
     </header>
     <main class="app-main">
-      <!-- 对应原项目的 keep-alive-route-reuse.strategy：学习中心切走再切回时保留状态 -->
+      <!-- 两个中心都保活：训练中心切走再切回时，训练结果、进度与运行中的定时器都会保留 -->
       <router-view v-slot="{ Component }">
-        <keep-alive include="LearningView">
+        <keep-alive include="ExperimentView,LearningView">
           <component :is="Component" />
         </keep-alive>
       </router-view>

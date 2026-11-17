@@ -72,7 +72,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as echarts from 'echarts'
 
 const init = echarts.init
@@ -547,7 +547,10 @@ function renderImportance() {
     importanceElement = importanceHost.value
     if (typeof ResizeObserver !== 'undefined') {
       importanceObserver?.disconnect()
-      importanceObserver = new ResizeObserver(() => importanceChart?.resize())
+      importanceObserver = new ResizeObserver(() => {
+        if (!importanceHost.value || importanceHost.value.clientWidth === 0) return
+        importanceChart?.resize()
+      })
       importanceObserver.observe(importanceHost.value)
     }
   }
@@ -577,6 +580,9 @@ function renderImportance() {
 }
 
 function resize() {
+  // keep-alive 缓存期间组件 DOM 已移出文档、尺寸为 0，
+  // 此时跳过 resize，避免 ECharts 在零尺寸容器上产生警告
+  if (!cardHost.value || cardHost.value.clientWidth === 0) return
   if (!pca3dActive.value && !chart) {
     renderChart()
   }
@@ -592,6 +598,7 @@ onMounted(() => {
   // 必须用 ResizeObserver 监听卡片自身尺寸才能让画布跟着自适应
   if (typeof ResizeObserver !== 'undefined' && cardHost.value) {
     cardObserver = new ResizeObserver(() => {
+      if (!cardHost.value || cardHost.value.clientWidth === 0) return
       chart?.resize()
       importanceChart?.resize()
       if (pca3dActive.value) {
@@ -606,6 +613,11 @@ onMounted(() => {
     renderChart()
     renderImportance()
   })
+})
+
+// 从学习中心切回时 DOM 重新插入，按当前容器尺寸重排图表
+onActivated(() => {
+  nextTick(() => resize())
 })
 
 onBeforeUnmount(() => {

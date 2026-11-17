@@ -110,6 +110,10 @@ import { ALGORITHMS, defaultParameterValues, toBackendParameters } from '@/servi
 import { buildExplanation } from '@/services/explanations'
 import { buildGuidanceState, caseById } from '@/services/cases'
 
+// keep-alive 的 include 按组件 name 匹配，必须显式声明，
+// 否则切换到学习中心时本组件会被销毁训练状态（session / 定时器 / 日志）全部丢失
+defineOptions({ name: 'ExperimentView' })
+
 const algorithms = ALGORITHMS
 
 const algorithmId = ref('linear_regression')
